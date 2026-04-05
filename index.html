@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <title>Kinetic Boxes: Diogo Style</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: sans-serif; }
+        
+        #ui-layer { position: absolute; top: 10px; left: 10px; z-index: 10; pointer-events: none; }
+        .status { color: rgba(255,255,255,0.8); background: rgba(0,0,0,0.5); padding: 5px 10px; margin-bottom: 5px; border-radius: 4px; font-size: 12px; max-width: 300px; letter-spacing: 1px;}
+        
+        #start-btn {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            padding: 20px 40px; font-size: 20px; background: rgba(0,0,0,0.8); color: white; 
+            border: 2px solid white; border-radius: 4px; cursor: pointer; z-index: 100;
+            text-transform: uppercase; letter-spacing: 4px; transition: all 0.3s;
+        }
+        #start-btn:hover { background: white; color: black; box-shadow: 0 0 30px rgba(255,255,255,0.5); }
+
+        #webcam {
+            position: absolute; bottom: 10px; left: 10px; width: 120px; height: 90px;
+            z-index: 2; border: 1px solid #333; border-radius: 4px; transform: scaleX(-1); opacity: 0.3;
+        }
+
+        #reset-msg {
+            position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%);
+            font-size: 16px; color: rgba(255,255,255,0.6); text-transform: uppercase; letter-spacing: 3px;
+            opacity: 0; transition: opacity 1s; pointer-events: none; z-index: 5;
+            background: rgba(0,0,0,0.5); padding: 10px 20px; border-radius: 20px;
+        }
+    </style>
+</head>
+<body>
+    <button id="start-btn">Iniciar Instalação</button>
+    <video id="webcam" autoplay playsinline></video>
+    
+    <video id="bg-music" loop playsinline style="display: none;">
+        <source src="background.mov" type="video/quicktime">
+        <source src="background.mp3" type="audio/mp3">
+    </video>
+    
+    <div id="ui-layer">
+        <div id="status-main" class="status">A aguardar início...</div>
+        <div id="status-p1" class="status">P1: Ausente</div>
+        <div id="status-p2" class="status">P2: Ausente</div>
+    </div>
+
+    <div id="reset-msg">⟳ A Reiniciar Ciclo ⟳</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/+esm"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+
+        const statusMain = document.getElementById("status-main");
+        const resetMsg = document.getElementById("reset-msg");
+        const startBtn = document.getElementById("start-btn");
+        const bgMusic = document.getElementById("bg-music");
+        const MAX_PIXEL_RATIO = 1.5;
+        const DETECTION_INTERVAL_MS = 1000 / 24;
+
+        // --- 0. AUDIO (Sintetizador + Video MOV) ---
+        let audioCtx;
+        startBtn.addEventListener('click', () => {
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // Tenta tocar o ficheiro MOV
+                bgMusic.play().then(() => {
+                    console.log("Audio de fundo iniciado");
+                }).catch(e => {
+                    console.log("Erro ao tocar MOV, a tentar sintetizador de emergência.");
+                });
+
+                startBtn.style.opacity = '0'; 
+                setTimeout(() => startBtn.style.display = 'none', 500);
+                startAI(); 
+            } catch (e) {
+                alert("Erro ao iniciar Audio: " + e.message);
+            }
+        });
+
+        function playSound(velocity) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            const intensity = Math.min(velocity / 8, 1);
+            
+            // Som mais "dark" e percussivo para combinar com o visual
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(80 + (intensity * 50), audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.2);
+            
+            gain.gain.setValueAtTime(0, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(intensity * 0.3, audioCtx.currentTime + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+            
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.4);
+        }
+
+        // --- 1. CENA 3D & RASTO ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050505); // Fundo quase preto
+        scene.fog = new THREE.Fog(0x050505, 9, 22);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
+        camera.position.set(0, 4, 9); 
+        camera.lookAt(0, 1, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: false });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.15;
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.autoClearColor = false; 
+        document.body.appendChild(renderer.domElement);
+
+        // Plano de Fade (Rasto)
+        const fadeMaterial = new THREE.MeshBasicMaterial({
+            color: 0x050505, 
+            transparent: true,
+            opacity: 0.15,
+            depthTest: false
+        });
+        const fadePlane = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), fadeMaterial);
+        fadePlane.position.z = -0.1; 
+        fadePlane.renderOrder = -1; 
+        camera.add(fadePlane);
+        scene.add(camera);
+
+        // Luzes
+        scene.add(new THREE.HemisphereLight(0xdde7ff, 0x080808, 0.7));
+
+        const keyLight = new THREE.DirectionalLight(0xfff6e0, 1.8);
+        keyLight.position.set(6, 11, 8);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.set(2048, 2048);
+        keyLight.shadow.camera.near = 0.5;
+        keyLight.shadow.camera.far = 35;
+        keyLight.shadow.camera.left = -10;
+        keyLight.shadow.camera.right = 10;
+        keyLight.shadow.camera.top = 10;
+        keyLight.shadow.camera.bottom = -10;
+        scene.add(keyLight);
+
+        const rimLight = new THREE.SpotLight(0x7fb3ff, 20, 30, Math.PI / 7, 0.35, 1.2);
+        rimLight.position.set(-5, 6, -3);
+        rimLight.target.position.set(0, 2, 0);
+        scene.add(rimLight);
+        scene.add(rimLight.target);
+
+        const fillLight = new THREE.PointLight(0xff7a3d, 8, 18, 2);
+        fillLight.position.set(0, 3, 5);
+        scene.add(fillLight);
+
+        const backgroundLight = new THREE.PointLight(0x4fd8ff, 2.5, 24, 2);
+        backgroundLight.position.set(0, 5, -7);
+        scene.add(backgroundLight);
+
+        const composer = new EffectComposer(renderer);
+        composer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
+        composer.setSize(window.innerWidth, window.innerHeight);
+        composer.addPass(new RenderPass(scene, camera));
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            0.75,
+            0.35,
+            0.82
+        );
+        composer.addPass(bloomPass);
+
+        // --- 2. FÍSICA ---
+        const world = new CANNON.World();
+        world.gravity.set(0, -9.82, 0);
+        world.allowSleep = true;
+        world.solver.iterations = 20;
+        world.solver.tolerance = 0.001;
+        
+        const matDefault = new CANNON.Material('default');
+        const matPlayer = new CANNON.Material('player');
+        world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matPlayer, { friction: 0.2, restitution: 0.15 }));
+        world.defaultContactMaterial.friction = 0.45;
+        world.defaultContactMaterial.restitution = 0.05;
+        world.defaultContactMaterial.contactEquationStiffness = 1e8;
+        world.defaultContactMaterial.contactEquationRelaxation = 3;
+        world.defaultContactMaterial.frictionEquationStiffness = 1e8;
+        world.defaultContactMaterial.frictionEquationRelaxation = 3;
+
+        const bodies = [], meshes = [], initialPos = [];
+        const gltfLoader = new GLTFLoader();
+        const boxSize = 1;
+        let modelTemplate = null;
+        let modelBaseSize = null;
+        let sharedBoxTexture = null;
+        let sourceBoxMaterials = null;
+        let collisionPulse = 0;
+        const collisionFocus = new THREE.Vector3(0, 1.5, 0);
+
+        // --- TEXTURA ESTILO DIOGO (PRETO E GIZ) ---
+        // Aqui está a função completa que tinhas pedido
+        function getCardboardTex() {
+            const cvs = document.createElement('canvas'); 
+            cvs.width = 512; cvs.height = 512; 
+            const ctx = cvs.getContext('2d');
+            
+            // 1. FUNDO PRETO (Roupa)
+            ctx.fillStyle = '#1a1a1a'; 
+            ctx.fillRect(0,0,512,512);
+            
+            // 2. TEXTURA (Ruído/Sujidade)
+            for(let i=0; i<1000; i++) {
+                ctx.fillStyle = Math.random() > 0.5 ? '#333' : '#000';
+                ctx.fillRect(Math.random()*512, Math.random()*512, 2, 2);
+            }
+
+            // 3. DESENHOS BRANCOS (Estilo Giz/Rascunho)
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.strokeStyle = '#e0e0e0'; 
+            ctx.lineWidth = 3 + Math.random() * 3;
+
+            ctx.beginPath();
+            const style = Math.floor(Math.random() * 3); 
+
+            if (style === 0) { 
+                // Estilo Abstrato (Caras/Formas)
+                let x = 256, y = 150;
+                ctx.moveTo(x, y);
+                for(let i=0; i<40; i++) {
+                    x += (Math.random()-0.5) * 80;
+                    y += (Math.random()-0.3) * 60; 
+                    if(x<20) x=20; if(x>490) x=490;
+                    if(y<20) y=20; if(y>490) y=490;
+                    ctx.lineTo(x, y);
+                }
+            } else if (style === 1) {
+                // Estilo Linhas/Texto Ilegível
+                for(let row=0; row<6; row++) {
+                    let y = 80 + row * 70;
+                    let x = 40;
+                    ctx.moveTo(x, y);
+                    for(let step=0; step<12; step++) {
+                        x += 35;
+                        ctx.lineTo(x, y + Math.sin(step)*15 + Math.random()*10);
+                    }
+                }
+            } else {
+                // Estilo Geometria Caótica
+                for(let k=0; k<6; k++) {
+                    ctx.moveTo(Math.random()*512, Math.random()*512);
+                    ctx.lineTo(Math.random()*512, Math.random()*512);
+                }
+            }
+            ctx.stroke();
+            
+            // Moldura Branca Suave
+            ctx.strokeStyle = '#555';
+            ctx.lineWidth = 4;
+            ctx.strokeRect(0,0,512,512);
+
+            return new THREE.CanvasTexture(cvs);
+        }
+
+        async function loadSourceBoxMaterials() {
+            if (sourceBoxMaterials) return sourceBoxMaterials;
+
+            const sourceGltf = await gltfLoader.loadAsync('cash drawer cube v3.glb?v=1');
+            const materials = [];
+            sourceGltf.scene.traverse((child) => {
+                if (!child.isMesh) return;
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+                for (const mat of mats) {
+                    if (!mat) continue;
+                    materials.push(mat.clone());
+                }
+            });
+
+            sourceBoxMaterials = materials;
+            return sourceBoxMaterials;
+        }
+
+        function applyModelMaterial(root) {
+            let materialIndex = 0;
+            root.traverse((child) => {
+                if (!child.isMesh) return;
+                child.castShadow = true;
+                child.receiveShadow = true;
+                const sourceMaterial = sourceBoxMaterials?.[materialIndex % sourceBoxMaterials.length];
+                materialIndex++;
+
+                if (sourceMaterial) {
+                    child.material = sourceMaterial.clone();
+                    child.material.needsUpdate = true;
+                } else {
+                    child.material = new THREE.MeshStandardMaterial({
+                        map: sharedBoxTexture,
+                        color: 0xffffff,
+                        roughness: 0.82,
+                        metalness: 0.08,
+                        envMapIntensity: 0.4
+                    });
+                    child.material.needsUpdate = true;
+                }
+            });
+        }
+
+        async function loadBoxModel() {
+            if (modelTemplate) return modelTemplate;
+            sharedBoxTexture = sharedBoxTexture || getCardboardTex();
+            await loadSourceBoxMaterials();
+
+            const gltf = await gltfLoader.loadAsync('cube.glb?v=3');
+            const root = gltf.scene;
+            const bounds = new THREE.Box3().setFromObject(root);
+            const size = new THREE.Vector3();
+            const center = new THREE.Vector3();
+            bounds.getSize(size);
+            bounds.getCenter(center);
+
+            const maxAxis = Math.max(size.x, size.y, size.z) || 1;
+            const scale = boxSize / maxAxis;
+            root.scale.setScalar(scale);
+            root.position.sub(center.multiplyScalar(scale));
+
+            const scaledBounds = new THREE.Box3().setFromObject(root);
+            const minY = scaledBounds.min.y;
+            root.position.y -= minY - boxSize * 0.5;
+            modelBaseSize = scaledBounds.getSize(new THREE.Vector3());
+
+            applyModelMaterial(root);
+            modelTemplate = root;
+            return modelTemplate;
+        }
+
+        function randomStageDimensions(kind = 'mixed') {
+            if (kind === 'pillar') {
+                return {
+                    x: 0.68 + Math.random() * 0.16,
+                    y: 1.65 + Math.random() * 0.8,
+                    z: 0.68 + Math.random() * 0.16
+                };
+            }
+
+            if (kind === 'block') {
+                return {
+                    x: 0.95 + Math.random() * 0.45,
+                    y: 0.72 + Math.random() * 0.24,
+                    z: 0.82 + Math.random() * 0.32
+                };
+            }
+
+            return Math.random() < 0.45 ? randomStageDimensions('pillar') : randomStageDimensions('block');
+        }
+
+        function createBox(x, y, z, dimensions) {
+            const halfExtents = new CANNON.Vec3(dimensions.x * 0.5, dimensions.y * 0.5, dimensions.z * 0.5);
+            const body = new CANNON.Body({
+                mass: 0.2 * dimensions.x * dimensions.y * dimensions.z,
+                position: new CANNON.Vec3(x, y, z),
+                shape: new CANNON.Box(halfExtents),
+                material: matDefault,
+                linearDamping: 0.18,
+                angularDamping: 0.35,
+                allowSleep: true,
+                sleepSpeedLimit: 0.12,
+                sleepTimeLimit: 0.6
+            });
+            world.addBody(body); bodies.push(body);
+
+            const mesh = modelTemplate.clone(true);
+            mesh.scale.set(
+                dimensions.x / modelBaseSize.x,
+                dimensions.y / modelBaseSize.y,
+                dimensions.z / modelBaseSize.z
+            );
+            scene.add(mesh); meshes.push(mesh);
+            
+            initialPos.push(new CANNON.Vec3(x,y,z));
+        }
+
+        // Chão e Grelha
+        const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane(), material: matDefault });
+        floorBody.quaternion.setFromEuler(-Math.PI/2, 0, 0); world.addBody(floorBody);
+        const grid = new THREE.GridHelper(30, 30, 0x3a3a3a, 0x111111);
+        grid.position.y = -0.001;
+        scene.add(grid);
+
+        const floorVisual = new THREE.Mesh(
+            new THREE.CircleGeometry(12, 64),
+            new THREE.MeshStandardMaterial({
+                color: 0x0d0d0d,
+                roughness: 0.95,
+                metalness: 0.02,
+                transparent: true,
+                opacity: 0.9
+            })
+        );
+        floorVisual.rotation.x = -Math.PI / 2;
+        floorVisual.receiveShadow = true;
+        scene.add(floorVisual);
+
+        function placeCluster(anchorX, anchorZ, config) {
+            const placed = [];
+            const baseItems = config.base.map((item) => ({ ...item, dimensions: randomStageDimensions(item.kind) }));
+            const gapX = config.gapX ?? 0.04;
+
+            let totalWidth = 0;
+            for (let i = 0; i < baseItems.length; i++) {
+                totalWidth += baseItems[i].dimensions.x;
+                if (i < baseItems.length - 1) totalWidth += gapX;
+            }
+
+            let cursorX = anchorX - totalWidth * 0.5;
+            for (const item of baseItems) {
+                const x = cursorX + item.dimensions.x * 0.5 + (item.shiftX || 0);
+                const z = anchorZ + (item.offsetZ || 0);
+                const y = item.dimensions.y * 0.5;
+                createBox(x, y, z, item.dimensions);
+                placed.push({ dimensions: item.dimensions, x, y, z });
+                cursorX += item.dimensions.x + gapX;
+            }
+
+            for (const item of config.stacks) {
+                const dimensions = randomStageDimensions(item.kind);
+                const support = placed[item.stackOn];
+                if (!support) continue;
+
+                const x = support.x + (item.offsetX || 0);
+                const z = support.z + (item.offsetZ || 0);
+                const y = support.y + support.dimensions.y * 0.5 + dimensions.y * 0.5 + (item.gapY ?? 0.03);
+                createBox(x, y, z, dimensions);
+                placed.push({ dimensions, x, y, z });
+            }
+        }
+
+        async function buildStack() {
+            statusMain.innerText = 'A carregar modelo 3D...';
+            try {
+                await loadBoxModel();
+            } catch (err) {
+                console.error(err);
+                statusMain.innerText = 'Erro ao carregar modelo 3D.';
+                throw err;
+            }
+
+            const clusters = [
+                {
+                    anchorX: -2.25,
+                    anchorZ: -0.95,
+                    gapX: 0.05,
+                    base: [
+                        { kind: 'block', offsetZ: -0.05 },
+                        { kind: 'block', offsetZ: 0.04 },
+                        { kind: 'block', offsetZ: 0.2 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 },
+                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
+                    ]
+                },
+                {
+                    anchorX: 2.25,
+                    anchorZ: -0.95,
+                    gapX: 0.05,
+                    base: [
+                        { kind: 'block', offsetZ: -0.05 },
+                        { kind: 'block', offsetZ: 0.04 },
+                        { kind: 'block', offsetZ: 0.2 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 1, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 },
+                        { kind: 'pillar', stackOn: 2, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
+                    ]
+                },
+                {
+                    anchorX: -1.95,
+                    anchorZ: 1.05,
+                    gapX: 0.05,
+                    base: [
+                        { kind: 'block', offsetZ: -0.04 },
+                        { kind: 'block', offsetZ: 0.1 },
+                        { kind: 'block', offsetZ: 0.26 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 }
+                    ]
+                },
+                {
+                    anchorX: 1.95,
+                    anchorZ: 1.05,
+                    gapX: 0.05,
+                    base: [
+                        { kind: 'block', offsetZ: -0.04 },
+                        { kind: 'block', offsetZ: 0.1 },
+                        { kind: 'block', offsetZ: 0.26 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 2, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
+                    ]
+                },
+                {
+                    anchorX: 0,
+                    anchorZ: -1.7,
+                    gapX: 0.06,
+                    base: [
+                        { kind: 'block', offsetZ: -0.05 },
+                        { kind: 'block', offsetZ: 0.05 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.02, gapY: 0.025 },
+                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.02, gapY: 0.025 }
+                    ]
+                },
+                {
+                    anchorX: 0,
+                    anchorZ: 1.75,
+                    gapX: 0.06,
+                    base: [
+                        { kind: 'block', offsetZ: -0.05 },
+                        { kind: 'block', offsetZ: 0.05 }
+                    ],
+                    stacks: [
+                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.02, gapY: 0.025 },
+                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.02, gapY: 0.025 }
+                    ]
+                }
+            ];
+
+            clusters.forEach((cluster) => placeCluster(cluster.anchorX, cluster.anchorZ, cluster));
+        }
+
+        // --- 3. PARTÍCULAS (BRANCAS) ---
+        const particles = [];
+        const particleTexture = createParticleTexture();
+        for(let i=0; i<60; i++) {
+            const p = new THREE.Sprite(new THREE.SpriteMaterial({
+                map: particleTexture,
+                color: new THREE.Color().setHSL(0.08 + Math.random() * 0.08, 0.9, 0.65),
+                transparent: true,
+                opacity: 0,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            }));
+            p.visible = false;
+            p.scale.setScalar(0.35);
+            scene.add(p);
+            particles.push(p);
+            p.userData = { life: 0, vel: new THREE.Vector3(), spin: 0 };
+        }
+
+        function createParticleTexture() {
+            const cvs = document.createElement('canvas');
+            cvs.width = 128;
+            cvs.height = 128;
+            const ctx = cvs.getContext('2d');
+            ctx.translate(64, 64);
+            ctx.beginPath();
+            for (let i = 0; i < 10; i++) {
+                const angle = (i / 10) * Math.PI * 2;
+                const radius = 30 + Math.sin(i * 1.7) * 8 + Math.random() * 10;
+                const x = Math.cos(angle) * radius;
+                const y = Math.sin(angle) * radius;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+            const grad = ctx.createRadialGradient(0, 0, 4, 0, 0, 52);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.25, 'rgba(255,242,200,0.95)');
+            grad.addColorStop(0.55, 'rgba(255,148,68,0.58)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fill();
+            const pngTexture = new THREE.TextureLoader().load(cvs.toDataURL('image/png'));
+            pngTexture.colorSpace = THREE.SRGBColorSpace;
+            return pngTexture;
+        }
+
+        function spawnExplosion(pos) {
+            let count = 0;
+            for(let p of particles) {
+                if(!p.visible && count < 10) {
+                    p.visible = true;
+                    p.position.copy(pos);
+                    p.position.y += 0.15;
+                    p.material.opacity = 1;
+                    p.scale.setScalar(0.18 + Math.random() * 0.35);
+                    p.userData.life = 1.0;
+                    p.userData.spin = (Math.random() - 0.5) * 0.35;
+                    p.userData.vel.set((Math.random()-0.5)*0.28, Math.random()*0.24 + 0.08, (Math.random()-0.5)*0.28);
+                    count++;
+                }
+            }
+        }
+
+        function triggerCollisionVisuals(impact, pos) {
+            const energy = Math.min(impact / 6, 1.2);
+            collisionPulse = Math.max(collisionPulse, energy);
+            collisionFocus.set(pos.x, pos.y + 1, pos.z);
+            rimLight.position.set(pos.x + 1.8, pos.y + 3.6, pos.z + 1.8);
+            rimLight.target.position.copy(collisionFocus);
+            backgroundLight.position.set(pos.x * 0.4, 4 + energy, -6 + pos.z * 0.2);
+        }
+
+        function wakeNearbyBoxes(x, y, z, radius = 2.2) {
+            const radiusSq = radius * radius;
+            for (const body of bodies) {
+                const dx = body.position.x - x;
+                const dy = body.position.y - y;
+                const dz = body.position.z - z;
+                if ((dx * dx) + (dy * dy) + (dz * dz) <= radiusSq) {
+                    body.wakeUp();
+                }
+            }
+        }
+
+        // --- 4. JOGADORES (Silhuetas) ---
+        const LINKS = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24]];
+
+        function createLine(color) {
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(LINKS.length * 6);
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: color, linewidth: 2, transparent: true, opacity: 0.8 }));
+        }
+
+        function createHandBody() {
+            const body = new CANNON.Body({
+                mass: 0,
+                type: CANNON.Body.KINEMATIC,
+                position: new CANNON.Vec3(0, -5, 0),
+                shape: new CANNON.Sphere(1.05),
+                material: matPlayer,
+                collisionResponse: true
+            });
+            body.userData = { lastPos: new CANNON.Vec3(0, -5, 0) };
+            body.updateMassProperties();
+            world.addBody(body);
+            body.addEventListener("collide", (e) => {
+                const impact = e.contact.getImpactVelocityAlongNormal();
+                if(Math.abs(impact) > 0.8) {
+                    let obj = (e.contact.bi === body) ? e.contact.bj : e.contact.bi;
+                    if(obj.mass > 0) { 
+                        spawnExplosion(body.position);
+                        playSound(Math.abs(impact));
+                        triggerCollisionVisuals(Math.abs(impact), body.position);
+                    }
+                }
+            });
+            return body;
+        }
+
+        const players = [
+            { id: 0, name: "P1", color: 0xffaaaa, hands: [], line: null, div: document.getElementById('status-p1') },
+            { id: 1, name: "P2", color: 0xaaddff, hands: [], line: null, div: document.getElementById('status-p2') }
+        ];
+
+        players.forEach(p => {
+            p.hands = [createHandBody(), createHandBody()];
+            p.line = createLine(p.color);
+            scene.add(p.line);
+        });
+
+        // --- 5. LOGICA & RESET ---
+        let lastSeen = Date.now();
+        let isResetting = false;
+
+        function updateReset() {
+            if(!isResetting) return;
+            let done = true;
+            for(let i=0; i<bodies.length; i++) {
+                bodies[i].velocity.set(0,0,0);
+                bodies[i].angularVelocity.set(0,0,0);
+                
+                bodies[i].position.x += (initialPos[i].x - bodies[i].position.x) * 0.05;
+                bodies[i].position.y += (initialPos[i].y - bodies[i].position.y) * 0.05;
+                bodies[i].position.z += (initialPos[i].z - bodies[i].position.z) * 0.05;
+                bodies[i].quaternion.slerp(new CANNON.Quaternion(0,0,0,1), 0.05);
+
+                if(bodies[i].position.distanceTo(initialPos[i]) > 0.05) done = false;
+            }
+            if(done) { isResetting = false; resetMsg.style.opacity = 0; }
+        }
+
+        // --- 6. IA ---
+        const video = document.getElementById("webcam");
+        let landmarker;
+        let lastDetectAt = 0;
+
+        async function startAI() {
+            try {
+                statusMain.innerText = "A carregar IA...";
+                const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+                landmarker = await PoseLandmarker.createFromOptions(vision, {
+                    baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`, delegate: "GPU" },
+                    runningMode: "VIDEO", numPoses: 2
+                });
+                await buildStack();
+                statusMain.innerText = "Ligado! Entra na câmara.";
+                
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", predict);
+            } catch (err) {
+                statusMain.innerText = "Erro: " + err.message;
+            }
+        }
+
+        function map(lm) {
+            return {
+                x: (0.5 - lm.x) * 12,
+                y: (1 - lm.y) * 8,
+                z: THREE.MathUtils.clamp(-lm.z * 14, -2.4, 2.4)
+            };
+        }
+
+        let lastTime = -1;
+        async function predict() {
+            const nowMs = performance.now();
+            if (landmarker && video.currentTime !== lastTime && nowMs - lastDetectAt >= DETECTION_INTERVAL_MS) {
+                const previousTime = lastTime;
+                lastTime = video.currentTime;
+                lastDetectAt = nowMs;
+                const result = await landmarker.detectForVideo(video, nowMs);
+                
+                let active = false;
+                players.forEach((p, idx) => {
+                    if(result.landmarks[idx]) {
+                        active = true;
+                        if(isResetting) isResetting = false;
+
+                        const lms = result.landmarks[idx];
+                        const dt = previousTime >= 0 ? Math.max(video.currentTime - previousTime, 1 / 60) : 1 / 60;
+                        const wrists = [lms[15], lms[16]];
+                        wrists.forEach((wrist, handIdx) => {
+                            const handBody = p.hands[handIdx];
+                            if (!wrist) {
+                                handBody.velocity.set(0, 0, 0);
+                                handBody.position.set(0, -10, 0);
+                                handBody.aabbNeedsUpdate = true;
+                                handBody.userData.lastPos.set(0, -10, 0);
+                                return;
+                            }
+
+                            const hand = map(wrist);
+                            const lastPos = handBody.userData.lastPos;
+                            handBody.velocity.set(
+                                (hand.x - lastPos.x) / dt,
+                                (hand.y - lastPos.y) / dt,
+                                (hand.z - lastPos.z) / dt
+                            );
+                            handBody.position.set(hand.x, hand.y, hand.z);
+                            handBody.aabbNeedsUpdate = true;
+                            handBody.userData.lastPos.set(hand.x, hand.y, hand.z);
+                            wakeNearbyBoxes(hand.x, hand.y, hand.z);
+                        });
+
+                        const arr = p.line.geometry.attributes.position.array;
+                        let k = 0;
+                        LINKS.forEach(pair => {
+                            const pointA = lms[pair[0]];
+                            const pointB = lms[pair[1]];
+                            if (!pointA || !pointB) return;
+                            const a = map(pointA);
+                            const b = map(pointB);
+                            arr[k++] = a.x; arr[k++] = a.y; arr[k++] = a.z;
+                            arr[k++] = b.x; arr[k++] = b.y; arr[k++] = b.z;
+                        });
+                        while (k < arr.length) arr[k++] = 0;
+                        p.line.geometry.attributes.position.needsUpdate = true;
+                        p.line.visible = true;
+                        p.div.innerText = p.name + ": Conectado";
+                    } else {
+                        p.hands.forEach((handBody) => {
+                            handBody.velocity.set(0, 0, 0);
+                            handBody.position.set(0, -10, 0);
+                            handBody.aabbNeedsUpdate = true;
+                            handBody.userData.lastPos.set(0, -10, 0);
+                        });
+                        p.line.visible = false;
+                        p.div.innerText = p.name + ": Ausente";
+                    }
+                });
+
+                if(active) {
+                    lastSeen = Date.now();
+                    resetMsg.style.opacity = 0;
+                } else if (!isResetting && Date.now() - lastSeen > 3000) {
+                    isResetting = true;
+                    resetMsg.style.opacity = 1;
+                }
+            }
+            requestAnimationFrame(predict);
+        }
+
+        // Loop Principal
+        let lastPhysicsTime = performance.now() / 1000;
+        function animate() {
+            requestAnimationFrame(animate);
+            const now = performance.now() / 1000;
+            const delta = Math.min(now - lastPhysicsTime, 0.05);
+            lastPhysicsTime = now;
+            
+            if(!isResetting) world.step(1/60, delta, 4);
+            else updateReset();
+
+            collisionPulse *= 0.9;
+            rimLight.intensity = 8 + collisionPulse * 18;
+            fillLight.intensity = 4 + collisionPulse * 10;
+            backgroundLight.intensity = 2.5 + collisionPulse * 7;
+            renderer.toneMappingExposure = 1.05 + collisionPulse * 0.18;
+            bloomPass.strength = 0.55 + collisionPulse * 0.65;
+
+            for(let i=0; i<meshes.length; i++) {
+                meshes[i].position.copy(bodies[i].position);
+                meshes[i].quaternion.copy(bodies[i].quaternion);
+            }
+
+            for(let p of particles) {
+                if(p.visible) {
+                    p.position.add(p.userData.vel);
+                    p.userData.vel.multiplyScalar(0.96);
+                    p.userData.vel.y -= 0.003;
+                    p.userData.life -= 0.035;
+                    p.material.opacity = p.userData.life * 0.9;
+                    p.material.rotation += p.userData.spin;
+                    p.scale.multiplyScalar(0.985);
+                    if(p.userData.life <= 0) p.visible = false;
+                }
+            }
+
+            composer.render();
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
