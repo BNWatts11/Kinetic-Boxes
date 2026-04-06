@@ -62,6 +62,7 @@
         import * as THREE from 'three';
         import * as CANNON from 'cannon-es';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
         import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
         import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -195,28 +196,39 @@
         const world = new CANNON.World();
         world.gravity.set(0, -9.82, 0);
         world.allowSleep = true;
-        world.solver.iterations = 20;
+        world.broadphase = new CANNON.SAPBroadphase(world);
+        world.solver.iterations = 15;
         world.solver.tolerance = 0.001;
         
         const matDefault = new CANNON.Material('default');
         const matPlayer = new CANNON.Material('player');
-        world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matPlayer, { friction: 0.2, restitution: 0.15 }));
+        world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matPlayer, {
+            friction: 0.25,
+            restitution: 0.08,
+            contactEquationStiffness: 5e7,
+            contactEquationRelaxation: 4,
+            frictionEquationStiffness: 1e7,
+            frictionEquationRelaxation: 4
+        }));
         world.defaultContactMaterial.friction = 0.45;
         world.defaultContactMaterial.restitution = 0.05;
-        world.defaultContactMaterial.contactEquationStiffness = 1e8;
-        world.defaultContactMaterial.contactEquationRelaxation = 3;
-        world.defaultContactMaterial.frictionEquationStiffness = 1e8;
-        world.defaultContactMaterial.frictionEquationRelaxation = 3;
+        world.defaultContactMaterial.contactEquationStiffness = 5e7;
+        world.defaultContactMaterial.contactEquationRelaxation = 4;
+        world.defaultContactMaterial.frictionEquationStiffness = 1e7;
+        world.defaultContactMaterial.frictionEquationRelaxation = 4;
 
-        const bodies = [], meshes = [], initialPos = [];
+        const bodies = [], initialPos = [], instanceScales = [];
         const gltfLoader = new GLTFLoader();
         const boxSize = 1;
-        let modelTemplate = null;
         let modelBaseSize = null;
         let sharedBoxTexture = null;
         let sourceBoxMaterials = null;
+        let boxGeometry = null;
+        let boxMaterial = null;
+        let boxInstancedMesh = null;
         let collisionPulse = 0;
         const collisionFocus = new THREE.Vector3(0, 1.5, 0);
+        const instanceDummy = new THREE.Object3D();
 
         // --- TEXTURA ESTILO DIOGO (PRETO E GIZ) ---
         // Aqui está a função completa que tinhas pedido
@@ -326,8 +338,21 @@
             });
         }
 
+        function createInstancedBoxes(count) {
+            if (boxInstancedMesh) {
+                scene.remove(boxInstancedMesh);
+            }
+
+            boxInstancedMesh = new THREE.InstancedMesh(boxGeometry, boxMaterial, count);
+            boxInstancedMesh.castShadow = true;
+            boxInstancedMesh.receiveShadow = true;
+            boxInstancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            boxInstancedMesh.frustumCulled = false;
+            scene.add(boxInstancedMesh);
+        }
+
         async function loadBoxModel() {
-            if (modelTemplate) return modelTemplate;
+            if (boxGeometry && boxMaterial && modelBaseSize) return;
             sharedBoxTexture = sharedBoxTexture || getCardboardTex();
             await loadSourceBoxMaterials();
 
@@ -343,15 +368,44 @@
             const scale = boxSize / maxAxis;
             root.scale.setScalar(scale);
             root.position.sub(center.multiplyScalar(scale));
-
-            const scaledBounds = new THREE.Box3().setFromObject(root);
-            const minY = scaledBounds.min.y;
-            root.position.y -= minY - boxSize * 0.5;
-            modelBaseSize = scaledBounds.getSize(new THREE.Vector3());
-
             applyModelMaterial(root);
-            modelTemplate = root;
-            return modelTemplate;
+            root.updateMatrixWorld(true);
+
+            const mergedGeometries = [];
+            let mergedMaterial = null;
+            root.traverse((child) => {
+                if (!child.isMesh) return;
+                const geometry = child.geometry.clone();
+                geometry.applyMatrix4(child.matrixWorld);
+                mergedGeometries.push(geometry);
+
+                if (!mergedMaterial) {
+                    const material = Array.isArray(child.material) ? child.material[0] : child.material;
+                    mergedMaterial = material.clone();
+                }
+            });
+
+            const mergedGeometry = mergedGeometries.length === 1
+                ? mergedGeometries[0]
+                : mergeGeometries(mergedGeometries, false);
+            mergedGeometry.computeBoundingBox();
+            const mergedBounds = mergedGeometry.boundingBox;
+            const mergedCenter = mergedBounds.getCenter(new THREE.Vector3());
+            const mergedSize = mergedBounds.getSize(new THREE.Vector3());
+            mergedGeometry.translate(-mergedCenter.x, -mergedCenter.y, -mergedCenter.z);
+            mergedGeometry.computeVertexNormals();
+            mergedGeometry.computeBoundingSphere();
+
+            boxGeometry = mergedGeometry;
+            boxMaterial = mergedMaterial || new THREE.MeshStandardMaterial({
+                map: sharedBoxTexture,
+                color: 0xffffff,
+                roughness: 0.82,
+                metalness: 0.08,
+                envMapIntensity: 0.4
+            });
+            boxMaterial.needsUpdate = true;
+            modelBaseSize = mergedSize;
         }
 
         function randomStageDimensions(kind = 'mixed') {
@@ -388,14 +442,11 @@
                 sleepTimeLimit: 0.6
             });
             world.addBody(body); bodies.push(body);
-
-            const mesh = modelTemplate.clone(true);
-            mesh.scale.set(
+            instanceScales.push(new THREE.Vector3(
                 dimensions.x / modelBaseSize.x,
                 dimensions.y / modelBaseSize.y,
                 dimensions.z / modelBaseSize.z
-            );
-            scene.add(mesh); meshes.push(mesh);
+            ));
             
             initialPos.push(new CANNON.Vec3(x,y,z));
         }
@@ -548,6 +599,8 @@
                 }
             ];
 
+            const totalInstances = clusters.reduce((sum, cluster) => sum + cluster.base.length + cluster.stacks.length, 0);
+            createInstancedBoxes(totalInstances);
             clusters.forEach((cluster) => placeCluster(cluster.anchorX, cluster.anchorZ, cluster));
         }
 
@@ -833,9 +886,17 @@
             renderer.toneMappingExposure = 1.05 + collisionPulse * 0.18;
             bloomPass.strength = 0.55 + collisionPulse * 0.65;
 
-            for(let i=0; i<meshes.length; i++) {
-                meshes[i].position.copy(bodies[i].position);
-                meshes[i].quaternion.copy(bodies[i].quaternion);
+            if (boxInstancedMesh) {
+                for (let i = 0; i < bodies.length; i++) {
+                    const body = bodies[i];
+                    const scale = instanceScales[i];
+                    instanceDummy.position.set(body.position.x, body.position.y, body.position.z);
+                    instanceDummy.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+                    instanceDummy.scale.copy(scale);
+                    instanceDummy.updateMatrix();
+                    boxInstancedMesh.setMatrixAt(i, instanceDummy.matrix);
+                }
+                boxInstancedMesh.instanceMatrix.needsUpdate = true;
             }
 
             for(let p of particles) {
