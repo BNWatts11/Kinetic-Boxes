@@ -74,6 +74,9 @@
         const bgMusic = document.getElementById("bg-music");
         const MAX_PIXEL_RATIO = 1.5;
         const DETECTION_INTERVAL_MS = 1000 / 24;
+        const BLOOM_CONFIG = { threshold: 0.22, strength: 1.05, radius: 0.58 };
+        const BLOOM_PULSE_STRENGTH = 0.9;
+        const CHALK_DUST_TEXTURE_URL = 'dust-png-1.png?v=1';
 
         // --- 0. AUDIO (Sintetizador + Video MOV) ---
         let audioCtx;
@@ -186,9 +189,9 @@
         composer.addPass(new RenderPass(scene, camera));
         const bloomPass = new UnrealBloomPass(
             new THREE.Vector2(window.innerWidth, window.innerHeight),
-            0.75,
-            0.35,
-            0.82
+            BLOOM_CONFIG.strength,
+            BLOOM_CONFIG.radius,
+            BLOOM_CONFIG.threshold
         );
         composer.addPass(bloomPass);
 
@@ -222,7 +225,6 @@
         const boxSize = 1;
         let modelBaseSize = null;
         let sharedBoxTexture = null;
-        let sourceBoxMaterials = null;
         let boxGeometry = null;
         let boxMaterial = null;
         let boxInstancedMesh = null;
@@ -295,46 +297,26 @@
             return new THREE.CanvasTexture(cvs);
         }
 
-        async function loadSourceBoxMaterials() {
-            if (sourceBoxMaterials) return sourceBoxMaterials;
-
-            const sourceGltf = await gltfLoader.loadAsync('cash drawer cube v3.glb?v=1');
-            const materials = [];
-            sourceGltf.scene.traverse((child) => {
-                if (!child.isMesh) return;
-                const mats = Array.isArray(child.material) ? child.material : [child.material];
-                for (const mat of mats) {
-                    if (!mat) continue;
-                    materials.push(mat.clone());
-                }
-            });
-
-            sourceBoxMaterials = materials;
-            return sourceBoxMaterials;
-        }
-
         function applyModelMaterial(root) {
-            let materialIndex = 0;
             root.traverse((child) => {
                 if (!child.isMesh) return;
                 child.castShadow = true;
                 child.receiveShadow = true;
-                const sourceMaterial = sourceBoxMaterials?.[materialIndex % sourceBoxMaterials.length];
-                materialIndex++;
-
-                if (sourceMaterial) {
-                    child.material = sourceMaterial.clone();
-                    child.material.needsUpdate = true;
-                } else {
-                    child.material = new THREE.MeshStandardMaterial({
+                const sourceMaterial = Array.isArray(child.material) ? child.material[0] : child.material;
+                child.material = sourceMaterial
+                    ? sourceMaterial.clone()
+                    : new THREE.MeshStandardMaterial({
                         map: sharedBoxTexture,
                         color: 0xffffff,
                         roughness: 0.82,
                         metalness: 0.08,
                         envMapIntensity: 0.4
                     });
-                    child.material.needsUpdate = true;
+                if (child.material.map) {
+                    child.material.map.colorSpace = THREE.SRGBColorSpace;
+                    child.material.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
                 }
+                child.material.needsUpdate = true;
             });
         }
 
@@ -354,7 +336,6 @@
         async function loadBoxModel() {
             if (boxGeometry && boxMaterial && modelBaseSize) return;
             sharedBoxTexture = sharedBoxTexture || getCardboardTex();
-            await loadSourceBoxMaterials();
 
             const gltf = await gltfLoader.loadAsync('cube.glb?v=3');
             const root = gltf.scene;
@@ -404,6 +385,10 @@
                 metalness: 0.08,
                 envMapIntensity: 0.4
             });
+            if (boxMaterial.map) {
+                boxMaterial.map.colorSpace = THREE.SRGBColorSpace;
+                boxMaterial.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            }
             boxMaterial.needsUpdate = true;
             modelBaseSize = mergedSize;
         }
@@ -411,17 +396,17 @@
         function randomStageDimensions(kind = 'mixed') {
             if (kind === 'pillar') {
                 return {
-                    x: 0.68 + Math.random() * 0.16,
-                    y: 1.65 + Math.random() * 0.8,
-                    z: 0.68 + Math.random() * 0.16
+                    x: 0.82 + Math.random() * 0.14,
+                    y: 1.35 + Math.random() * 0.55,
+                    z: 0.82 + Math.random() * 0.14
                 };
             }
 
             if (kind === 'block') {
                 return {
-                    x: 0.95 + Math.random() * 0.45,
-                    y: 0.72 + Math.random() * 0.24,
-                    z: 0.82 + Math.random() * 0.32
+                    x: 1.0 + Math.random() * 0.35,
+                    y: 0.72 + Math.random() * 0.18,
+                    z: 0.9 + Math.random() * 0.24
                 };
             }
 
@@ -436,10 +421,10 @@
                 shape: new CANNON.Box(halfExtents),
                 material: matDefault,
                 linearDamping: 0.18,
-                angularDamping: 0.35,
+                angularDamping: 0.5,
                 allowSleep: true,
-                sleepSpeedLimit: 0.12,
-                sleepTimeLimit: 0.6
+                sleepSpeedLimit: 0.08,
+                sleepTimeLimit: 0.45
             });
             world.addBody(body); bodies.push(body);
             instanceScales.push(new THREE.Vector3(
@@ -472,37 +457,200 @@
         floorVisual.receiveShadow = true;
         scene.add(floorVisual);
 
-        function placeCluster(anchorX, anchorZ, config) {
-            const placed = [];
-            const baseItems = config.base.map((item) => ({ ...item, dimensions: randomStageDimensions(item.kind) }));
-            const gapX = config.gapX ?? 0.04;
+        function addPlacement(plan, x, z, dimensions, support = null, gapY = 0.03) {
+            const y = support
+                ? support.y + support.dimensions.y * 0.5 + dimensions.y * 0.5 + gapY
+                : dimensions.y * 0.5;
+            const placement = { x, y, z, dimensions, support };
+            plan.push(placement);
+            return placement;
+        }
 
-            let totalWidth = 0;
-            for (let i = 0; i < baseItems.length; i++) {
-                totalWidth += baseItems[i].dimensions.x;
-                if (i < baseItems.length - 1) totalWidth += gapX;
+        function overlapsXZ(a, b, padding = 0.12) {
+            return Math.abs(a.x - b.x) < (a.dimensions.x + b.dimensions.x) * 0.5 + padding
+                && Math.abs(a.z - b.z) < (a.dimensions.z + b.dimensions.z) * 0.5 + padding;
+        }
+
+        function hasPlacementConflict(plan, candidate, padding = 0.12) {
+            return plan.some((existing) => {
+                const verticalGap = Math.abs(existing.y - candidate.y);
+                const stackedSeparation = (existing.dimensions.y + candidate.dimensions.y) * 0.5 + 0.02;
+                if (verticalGap >= stackedSeparation) return false;
+                return overlapsXZ(existing, candidate, padding);
+            });
+        }
+
+        function addGroundPlacement(plan, x, z, dimensions, maxAttempts = 28) {
+            let candidate = { x, z, dimensions, y: dimensions.y * 0.5 };
+            if (!hasPlacementConflict(plan, candidate)) {
+                return addPlacement(plan, x, z, dimensions);
             }
 
-            let cursorX = anchorX - totalWidth * 0.5;
-            for (const item of baseItems) {
-                const x = cursorX + item.dimensions.x * 0.5 + (item.shiftX || 0);
-                const z = anchorZ + (item.offsetZ || 0);
-                const y = item.dimensions.y * 0.5;
-                createBox(x, y, z, item.dimensions);
-                placed.push({ dimensions: item.dimensions, x, y, z });
-                cursorX += item.dimensions.x + gapX;
+            const startX = x;
+            const startZ = z;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                const angle = attempt * 1.7;
+                const radius = 0.24 * attempt;
+                candidate = {
+                    x: startX + Math.cos(angle) * radius,
+                    z: startZ + Math.sin(angle) * radius,
+                    dimensions,
+                    y: dimensions.y * 0.5
+                };
+                if (!hasPlacementConflict(plan, candidate)) {
+                    return addPlacement(plan, candidate.x, candidate.z, dimensions);
+                }
             }
 
-            for (const item of config.stacks) {
-                const dimensions = randomStageDimensions(item.kind);
-                const support = placed[item.stackOn];
+            return null;
+        }
+
+        function sanitizePlan(plan) {
+            const stablePlan = [];
+            const sorted = [...plan].sort((a, b) => a.y - b.y);
+
+            for (const placement of sorted) {
+                if (!placement.support) {
+                    if (!hasPlacementConflict(stablePlan, placement, 0.12)) {
+                        stablePlan.push({ ...placement });
+                    }
+                    continue;
+                }
+
+                const support = stablePlan.find((item) => item === placement.support || (
+                    item.x === placement.support.x &&
+                    item.y === placement.support.y &&
+                    item.z === placement.support.z
+                ));
                 if (!support) continue;
 
-                const x = support.x + (item.offsetX || 0);
-                const z = support.z + (item.offsetZ || 0);
-                const y = support.y + support.dimensions.y * 0.5 + dimensions.y * 0.5 + (item.gapY ?? 0.03);
-                createBox(x, y, z, dimensions);
-                placed.push({ dimensions, x, y, z });
+                const footprintMarginX = (support.dimensions.x - placement.dimensions.x) * 0.5;
+                const footprintMarginZ = (support.dimensions.z - placement.dimensions.z) * 0.5;
+                if (footprintMarginX < 0.04 || footprintMarginZ < 0.04) continue;
+                if (Math.abs(placement.x - support.x) > footprintMarginX * 0.75) continue;
+                if (Math.abs(placement.z - support.z) > footprintMarginZ * 0.75) continue;
+
+                const expectedY = support.y + support.dimensions.y * 0.5 + placement.dimensions.y * 0.5 + 0.02;
+                const candidate = { ...placement, y: expectedY, support };
+                if (!hasPlacementConflict(stablePlan, candidate, 0.06)) {
+                    stablePlan.push(candidate);
+                }
+            }
+
+            return stablePlan;
+        }
+
+        function createWallAggregation(plan, anchorX, anchorZ, options = {}) {
+            const segments = options.segments ?? (4 + Math.floor(Math.random() * 3));
+            const angle = options.angle ?? (Math.random() * Math.PI);
+            const dirX = Math.cos(angle);
+            const dirZ = Math.sin(angle);
+            const sideX = -dirZ;
+            const sideZ = dirX;
+            const spacing = options.spacing ?? 0.16;
+            const placements = [];
+            const baseDimensions = Array.from({ length: segments }, () => randomStageDimensions(Math.random() < 0.35 ? 'pillar' : 'block'));
+            const totalLength = baseDimensions.reduce((sum, dims, idx) => {
+                return sum + dims.x + (idx < baseDimensions.length - 1 ? spacing : 0);
+            }, 0);
+            let cursor = -totalLength * 0.5;
+            for (let i = 0; i < segments; i++) {
+                const dimensions = baseDimensions[i];
+                const offset = cursor + dimensions.x * 0.5;
+                const lateral = (Math.random() - 0.5) * 0.18;
+                const x = anchorX + dirX * offset + sideX * lateral;
+                const z = anchorZ + dirZ * offset + sideZ * lateral;
+                const placed = addGroundPlacement(plan, x, z, dimensions);
+                if (!placed) {
+                    cursor += dimensions.x + spacing;
+                    continue;
+                }
+                placements.push(placed);
+
+                if (Math.random() < 0.25) {
+                    const topKind = Math.random() < 0.6 ? 'pillar' : 'block';
+                    const topDimensions = randomStageDimensions(topKind);
+                    topDimensions.x = Math.min(topDimensions.x, dimensions.x * 0.82);
+                    topDimensions.z = Math.min(topDimensions.z, dimensions.z * 0.82);
+                    addPlacement(
+                        plan,
+                        placed.x,
+                        placed.z,
+                        topDimensions,
+                        placed,
+                        0.025
+                    );
+                }
+
+                cursor += dimensions.x + spacing;
+            }
+        }
+
+        function createPlatformAggregation(plan, anchorX, anchorZ, options = {}) {
+            const cols = options.cols ?? (2 + Math.floor(Math.random() * 2));
+            const rows = options.rows ?? (2 + Math.floor(Math.random() * 2));
+            const gap = options.gap ?? 0.06;
+            const cells = [];
+
+            let totalWidth = 0;
+            for (let col = 0; col < cols; col++) {
+                const colWidth = 0.9 + Math.random() * 0.28;
+                cells.push(colWidth);
+                totalWidth += colWidth;
+                if (col < cols - 1) totalWidth += gap;
+            }
+
+            let xCursor = anchorX - totalWidth * 0.5;
+            for (let col = 0; col < cols; col++) {
+                const width = cells[col];
+                for (let row = 0; row < rows; row++) {
+                    const dimensions = randomStageDimensions('block');
+                    dimensions.x = width;
+                    dimensions.y *= 0.85;
+                    dimensions.z = 0.82 + Math.random() * 0.22;
+                    const z = anchorZ + (row - (rows - 1) * 0.5) * (dimensions.z + gap * 0.8);
+                    addGroundPlacement(plan, xCursor + width * 0.5, z, dimensions);
+                }
+                xCursor += width + gap;
+            }
+
+            if (Math.random() < 0.35) {
+                const hero = randomStageDimensions(Math.random() < 0.5 ? 'pillar' : 'block');
+                const support = plan.reduce((best, item) => {
+                    if (item.y > item.dimensions.y * 0.5 + 0.001) return best;
+                    if (item.dimensions.x < 0.95 || item.dimensions.z < 0.85) return best;
+                    const dist = Math.hypot(item.x - anchorX, item.z - anchorZ);
+                    if (!best || dist < best.dist) return { item, dist };
+                    return best;
+                }, null)?.item;
+                if (support) {
+                    hero.x = Math.min(hero.x, support.dimensions.x * 0.78);
+                    hero.z = Math.min(hero.z, support.dimensions.z * 0.78);
+                    addPlacement(plan, support.x, support.z, hero, support, 0.025);
+                }
+            }
+        }
+
+        function createColumnAggregation(plan, anchorX, anchorZ, options = {}) {
+            const count = options.count ?? (3 + Math.floor(Math.random() * 3));
+            const radius = options.radius ?? (1.05 + Math.random() * 0.3);
+            const supports = [];
+
+            for (let i = 0; i < count; i++) {
+                const angle = (i / count) * Math.PI * 2 + Math.random() * 0.35;
+                const x = anchorX + Math.cos(angle) * radius;
+                const z = anchorZ + Math.sin(angle) * radius;
+                const kind = i % 2 === 0 ? 'pillar' : 'block';
+                const placed = addGroundPlacement(plan, x, z, randomStageDimensions(kind));
+                supports.push(placed);
+            }
+
+            const centerBase = addGroundPlacement(plan, anchorX, anchorZ, randomStageDimensions('block'));
+            if (centerBase && Math.random() < 0.5) {
+                const top = randomStageDimensions('pillar');
+                top.x = Math.min(top.x * 0.82, centerBase.dimensions.x * 0.78);
+                top.z = Math.min(top.z * 0.82, centerBase.dimensions.z * 0.78);
+                addPlacement(plan, anchorX, anchorZ, top, centerBase, 0.02);
             }
         }
 
@@ -516,139 +664,138 @@
                 throw err;
             }
 
-            const clusters = [
-                {
-                    anchorX: -2.25,
-                    anchorZ: -0.95,
-                    gapX: 0.05,
-                    base: [
-                        { kind: 'block', offsetZ: -0.05 },
-                        { kind: 'block', offsetZ: 0.04 },
-                        { kind: 'block', offsetZ: 0.2 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 },
-                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
-                    ]
-                },
-                {
-                    anchorX: 2.25,
-                    anchorZ: -0.95,
-                    gapX: 0.05,
-                    base: [
-                        { kind: 'block', offsetZ: -0.05 },
-                        { kind: 'block', offsetZ: 0.04 },
-                        { kind: 'block', offsetZ: 0.2 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 1, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 },
-                        { kind: 'pillar', stackOn: 2, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
-                    ]
-                },
-                {
-                    anchorX: -1.95,
-                    anchorZ: 1.05,
-                    gapX: 0.05,
-                    base: [
-                        { kind: 'block', offsetZ: -0.04 },
-                        { kind: 'block', offsetZ: 0.1 },
-                        { kind: 'block', offsetZ: 0.26 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.03, gapY: 0.025 }
-                    ]
-                },
-                {
-                    anchorX: 1.95,
-                    anchorZ: 1.05,
-                    gapX: 0.05,
-                    base: [
-                        { kind: 'block', offsetZ: -0.04 },
-                        { kind: 'block', offsetZ: 0.1 },
-                        { kind: 'block', offsetZ: 0.26 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 2, offsetX: -0.02, offsetZ: 0.03, gapY: 0.025 }
-                    ]
-                },
-                {
-                    anchorX: 0,
-                    anchorZ: -1.7,
-                    gapX: 0.06,
-                    base: [
-                        { kind: 'block', offsetZ: -0.05 },
-                        { kind: 'block', offsetZ: 0.05 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.02, gapY: 0.025 },
-                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.02, gapY: 0.025 }
-                    ]
-                },
-                {
-                    anchorX: 0,
-                    anchorZ: 1.75,
-                    gapX: 0.06,
-                    base: [
-                        { kind: 'block', offsetZ: -0.05 },
-                        { kind: 'block', offsetZ: 0.05 }
-                    ],
-                    stacks: [
-                        { kind: 'pillar', stackOn: 0, offsetX: 0.02, offsetZ: 0.02, gapY: 0.025 },
-                        { kind: 'pillar', stackOn: 1, offsetX: -0.02, offsetZ: 0.02, gapY: 0.025 }
-                    ]
-                }
-            ];
+            bodies.forEach((body) => world.removeBody(body));
+            bodies.length = 0;
+            initialPos.length = 0;
+            instanceScales.length = 0;
 
-            const totalInstances = clusters.reduce((sum, cluster) => sum + cluster.base.length + cluster.stacks.length, 0);
-            createInstancedBoxes(totalInstances);
-            clusters.forEach((cluster) => placeCluster(cluster.anchorX, cluster.anchorZ, cluster));
+            const plan = [];
+
+            createWallAggregation(plan, -2.3, -0.85, { segments: 5, angle: Math.PI * 0.48 });
+            createWallAggregation(plan, 2.3, -0.9, { segments: 5, angle: Math.PI * 0.52 });
+            createWallAggregation(plan, -1.8, 1.15, { segments: 4, angle: Math.PI * 0.18 });
+            createWallAggregation(plan, 1.95, 1.2, { segments: 4, angle: Math.PI * 0.82 });
+
+            createPlatformAggregation(plan, 0, -1.65, { cols: 3, rows: 2, gap: 0.07 });
+            createPlatformAggregation(plan, 0.15, 1.85, { cols: 2, rows: 2, gap: 0.06 });
+
+            createColumnAggregation(plan, -2.65, 0.55, { count: 4, radius: 1.12 });
+            createColumnAggregation(plan, 2.65, 0.45, { count: 4, radius: 1.12 });
+
+            const stablePlan = sanitizePlan(plan);
+            createInstancedBoxes(stablePlan.length);
+            stablePlan.forEach((item) => createBox(item.x, item.y, item.z, item.dimensions));
         }
 
-        // --- 3. PARTÍCULAS (BRANCAS) ---
+        // --- 3. PARTÍCULAS (SPRITES ORGÂNICOS) ---
         const particles = [];
         const particleTexture = createParticleTexture();
         for(let i=0; i<60; i++) {
             const p = new THREE.Sprite(new THREE.SpriteMaterial({
                 map: particleTexture,
-                color: new THREE.Color().setHSL(0.08 + Math.random() * 0.08, 0.9, 0.65),
+                color: new THREE.Color().setHSL(0.08 + Math.random() * 0.04, 0.55, 0.88),
                 transparent: true,
                 opacity: 0,
                 blending: THREE.AdditiveBlending,
                 depthWrite: false
             }));
             p.visible = false;
-            p.scale.setScalar(0.35);
+            p.scale.setScalar(0.5);
             scene.add(p);
             particles.push(p);
             p.userData = { life: 0, vel: new THREE.Vector3(), spin: 0 };
         }
 
         function createParticleTexture() {
+            const fallbackTexture = createFallbackParticleTexture();
+            const loader = new THREE.TextureLoader();
+            loader.load(
+                CHALK_DUST_TEXTURE_URL,
+                (loadedTexture) => {
+                    const dustTexture = createDustTextureFromImage(loadedTexture.image);
+                    for (const particle of particles) {
+                        particle.material.map = dustTexture;
+                        particle.material.needsUpdate = true;
+                    }
+                },
+                undefined,
+                (err) => {
+                    console.warn('Chalk dust PNG not found, using fallback dust sprite.', err);
+                }
+            );
+            return fallbackTexture;
+        }
+
+        function createDustTextureFromImage(image) {
             const cvs = document.createElement('canvas');
-            cvs.width = 128;
-            cvs.height = 128;
+            cvs.width = image.naturalWidth || image.width;
+            cvs.height = image.naturalHeight || image.height;
             const ctx = cvs.getContext('2d');
-            ctx.translate(64, 64);
+            ctx.drawImage(image, 0, 0, cvs.width, cvs.height);
+
+            const data = ctx.getImageData(0, 0, cvs.width, cvs.height);
+            for (let i = 0; i < data.data.length; i += 4) {
+                const r = data.data[i];
+                const g = data.data[i + 1];
+                const b = data.data[i + 2];
+                const luminance = (r * 0.299) + (g * 0.587) + (b * 0.114);
+                const alpha = THREE.MathUtils.clamp((255 - luminance) * 1.7, 0, 255);
+
+                data.data[i] = 255;
+                data.data[i + 1] = 245;
+                data.data[i + 2] = 220;
+                data.data[i + 3] = alpha;
+            }
+            ctx.putImageData(data, 0, 0);
+
+            const texture = new THREE.CanvasTexture(cvs);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.wrapS = THREE.ClampToEdgeWrapping;
+            texture.wrapT = THREE.ClampToEdgeWrapping;
+            texture.minFilter = THREE.LinearFilter;
+            texture.magFilter = THREE.LinearFilter;
+            texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        function createFallbackParticleTexture() {
+            const cvs = document.createElement('canvas');
+            cvs.width = 192;
+            cvs.height = 192;
+            const ctx = cvs.getContext('2d');
+            ctx.translate(96, 96);
             ctx.beginPath();
-            for (let i = 0; i < 10; i++) {
-                const angle = (i / 10) * Math.PI * 2;
-                const radius = 30 + Math.sin(i * 1.7) * 8 + Math.random() * 10;
+            for (let i = 0; i < 18; i++) {
+                const angle = (i / 18) * Math.PI * 2;
+                const radius = 42 + Math.sin(i * 1.7) * 10 + Math.random() * 16;
                 const x = Math.cos(angle) * radius;
                 const y = Math.sin(angle) * radius;
                 if (i === 0) ctx.moveTo(x, y);
                 else ctx.lineTo(x, y);
             }
             ctx.closePath();
-            const grad = ctx.createRadialGradient(0, 0, 4, 0, 0, 52);
-            grad.addColorStop(0, 'rgba(255,255,255,1)');
-            grad.addColorStop(0.25, 'rgba(255,242,200,0.95)');
-            grad.addColorStop(0.55, 'rgba(255,148,68,0.58)');
+            const grad = ctx.createRadialGradient(0, 0, 8, 0, 0, 78);
+            grad.addColorStop(0, 'rgba(255,255,255,0.98)');
+            grad.addColorStop(0.22, 'rgba(255,244,214,0.9)');
+            grad.addColorStop(0.52, 'rgba(255,196,143,0.45)');
             grad.addColorStop(1, 'rgba(0,0,0,0)');
             ctx.fillStyle = grad;
             ctx.fill();
-            const pngTexture = new THREE.TextureLoader().load(cvs.toDataURL('image/png'));
-            pngTexture.colorSpace = THREE.SRGBColorSpace;
-            return pngTexture;
+            for (let i = 0; i < 65; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const radius = Math.random() * 70;
+                const x = Math.cos(angle) * radius;
+                const y = Math.sin(angle) * radius;
+                ctx.fillStyle = `rgba(255,255,255,${0.03 + Math.random() * 0.08})`;
+                ctx.beginPath();
+                ctx.arc(x, y, 1 + Math.random() * 5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            const texture = new THREE.CanvasTexture(cvs);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.needsUpdate = true;
+            return texture;
         }
 
         function spawnExplosion(pos) {
@@ -659,10 +806,10 @@
                     p.position.copy(pos);
                     p.position.y += 0.15;
                     p.material.opacity = 1;
-                    p.scale.setScalar(0.18 + Math.random() * 0.35);
+                    p.scale.setScalar(0.28 + Math.random() * 0.52);
                     p.userData.life = 1.0;
-                    p.userData.spin = (Math.random() - 0.5) * 0.35;
-                    p.userData.vel.set((Math.random()-0.5)*0.28, Math.random()*0.24 + 0.08, (Math.random()-0.5)*0.28);
+                    p.userData.spin = (Math.random() - 0.5) * 0.1;
+                    p.userData.vel.set((Math.random()-0.5)*0.18, Math.random()*0.18 + 0.04, (Math.random()-0.5)*0.18);
                     count++;
                 }
             }
@@ -884,7 +1031,9 @@
             fillLight.intensity = 4 + collisionPulse * 10;
             backgroundLight.intensity = 2.5 + collisionPulse * 7;
             renderer.toneMappingExposure = 1.05 + collisionPulse * 0.18;
-            bloomPass.strength = 0.55 + collisionPulse * 0.65;
+            bloomPass.threshold = Math.max(0.14, BLOOM_CONFIG.threshold - collisionPulse * 0.05);
+            bloomPass.radius = BLOOM_CONFIG.radius + collisionPulse * 0.08;
+            bloomPass.strength = BLOOM_CONFIG.strength + collisionPulse * BLOOM_PULSE_STRENGTH;
 
             if (boxInstancedMesh) {
                 for (let i = 0; i < bodies.length; i++) {
@@ -902,12 +1051,12 @@
             for(let p of particles) {
                 if(p.visible) {
                     p.position.add(p.userData.vel);
-                    p.userData.vel.multiplyScalar(0.96);
-                    p.userData.vel.y -= 0.003;
-                    p.userData.life -= 0.035;
-                    p.material.opacity = p.userData.life * 0.9;
+                    p.userData.vel.multiplyScalar(0.94);
+                    p.userData.vel.y -= 0.0025;
+                    p.userData.life -= 0.028;
+                    p.material.opacity = p.userData.life * 0.72;
                     p.material.rotation += p.userData.spin;
-                    p.scale.multiplyScalar(0.985);
+                    p.scale.multiplyScalar(1.012);
                     if(p.userData.life <= 0) p.visible = false;
                 }
             }
