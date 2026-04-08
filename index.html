@@ -63,6 +63,7 @@
         import * as CANNON from 'cannon-es';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
         import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+        import { DecalGeometry } from 'three/addons/geometries/DecalGeometry.js';
         import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
         import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -77,6 +78,8 @@
         const BLOOM_CONFIG = { threshold: 0.22, strength: 1.05, radius: 0.58 };
         const BLOOM_PULSE_STRENGTH = 0.9;
         const CHALK_DUST_TEXTURE_URL = 'dust-png-1.png?v=1';
+        const MAX_DECALS = 36;
+        const DECAL_IMPACT_THRESHOLD = 1.4;
 
         // --- 0. AUDIO (Sintetizador + Video MOV) ---
         let audioCtx;
@@ -183,6 +186,9 @@
         backgroundLight.position.set(0, 5, -7);
         scene.add(backgroundLight);
 
+        // Post-processing is handled in a separate composer so the scene can keep a dark stage
+        // base while selectively amplifying bright highlights. This gives the installation a
+        // theatrical "fluorescent" response without forcing every material to be emissive.
         const composer = new EffectComposer(renderer);
         composer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
         composer.setSize(window.innerWidth, window.innerHeight);
@@ -196,6 +202,11 @@
         composer.addPass(bloomPass);
 
         // --- 2. FÍSICA ---
+        // The physics world is tuned for stacks and repeated impacts rather than speed alone.
+        // SAPBroadphase is more stable than the naive broadphase for many resting bodies because
+        // it reduces unnecessary broadphase pair tests once objects align along the main axes.
+        // Higher solver iterations and softer contact relaxation make the pile settle instead of
+        // vibrating, which is essential in an installation where "rest" should read as intentional.
         const world = new CANNON.World();
         world.gravity.set(0, -9.82, 0);
         world.allowSleep = true;
@@ -220,6 +231,10 @@
         world.defaultContactMaterial.frictionEquationStiffness = 1e7;
         world.defaultContactMaterial.frictionEquationRelaxation = 4;
 
+        // Physics and rendering stay separated on purpose:
+        // bodies = simulation truth, initialPos = reset targets, instanceScales = visual scaling
+        // data for InstancedMesh. This split keeps Cannon authoritative while allowing a very
+        // cheap render path on the GPU.
         const bodies = [], initialPos = [], instanceScales = [];
         const gltfLoader = new GLTFLoader();
         const boxSize = 1;
@@ -229,8 +244,13 @@
         let boxMaterial = null;
         let boxInstancedMesh = null;
         let collisionPulse = 0;
+        let spotlightImpact = 0;
+        let decalTexture = null;
+        let decalMaterial = null;
         const collisionFocus = new THREE.Vector3(0, 1.5, 0);
         const instanceDummy = new THREE.Object3D();
+        const decalPool = [];
+        const decalProxyMesh = new THREE.Mesh();
 
         // --- TEXTURA ESTILO DIOGO (PRETO E GIZ) ---
         // Aqui está a função completa que tinhas pedido
@@ -297,6 +317,10 @@
             return new THREE.CanvasTexture(cvs);
         }
 
+        // The material pipeline preserves the authored Blender look whenever possible.
+        // Earlier experiments used more procedural shading, but the final installation favors
+        // fidelity to the original cube artwork, then normalizes color space/anisotropy so the
+        // same asset remains legible under strong bloom and dark stage lighting.
         function applyModelMaterial(root) {
             root.traverse((child) => {
                 if (!child.isMesh) return;
@@ -320,6 +344,10 @@
             });
         }
 
+        // InstancedMesh is the core performance optimization of the installation.
+        // Instead of cloning one full Three.js hierarchy per box, we upload one geometry/material
+        // pair and vary only the transform matrix per instance. This keeps Cannon bodies
+        // independent while collapsing rendering into a much smaller number of draw calls.
         function createInstancedBoxes(count) {
             if (boxInstancedMesh) {
                 scene.remove(boxInstancedMesh);
@@ -333,6 +361,10 @@
             scene.add(boxInstancedMesh);
         }
 
+        // The imported GLB is normalized once and merged into a single renderable geometry.
+        // Doing this upfront avoids paying the cost of traversing/cloning a complex 5MB model
+        // for every box at runtime, which is especially important because MediaPipe and bloom
+        // are already sharing the same laptop GPU budget.
         async function loadBoxModel() {
             if (boxGeometry && boxMaterial && modelBaseSize) return;
             sharedBoxTexture = sharedBoxTexture || getCardboardTex();
@@ -413,8 +445,16 @@
             return Math.random() < 0.45 ? randomStageDimensions('pillar') : randomStageDimensions('block');
         }
 
+        // Each scenic element still gets its own Cannon body even though rendering is instanced.
+        // This keeps collisions believable and lets each box receive decals, sleep, reset and be
+        // pushed independently, while the visual layer stays lightweight.
         function createBox(x, y, z, dimensions) {
             const halfExtents = new CANNON.Vec3(dimensions.x * 0.5, dimensions.y * 0.5, dimensions.z * 0.5);
+            const scale = new THREE.Vector3(
+                dimensions.x / modelBaseSize.x,
+                dimensions.y / modelBaseSize.y,
+                dimensions.z / modelBaseSize.z
+            );
             const body = new CANNON.Body({
                 mass: 0.2 * dimensions.x * dimensions.y * dimensions.z,
                 position: new CANNON.Vec3(x, y, z),
@@ -426,12 +466,10 @@
                 sleepSpeedLimit: 0.08,
                 sleepTimeLimit: 0.45
             });
+            body.userData = { scale, lastDecalAt: -Infinity };
+            body.addEventListener("collide", (event) => handleBoxCollision(body, event));
             world.addBody(body); bodies.push(body);
-            instanceScales.push(new THREE.Vector3(
-                dimensions.x / modelBaseSize.x,
-                dimensions.y / modelBaseSize.y,
-                dimensions.z / modelBaseSize.z
-            ));
+            instanceScales.push(scale);
             
             initialPos.push(new CANNON.Vec3(x,y,z));
         }
@@ -456,6 +494,131 @@
         floorVisual.rotation.x = -Math.PI / 2;
         floorVisual.receiveShadow = true;
         scene.add(floorVisual);
+
+        // Decals are pooled because collision marks are visually useful but geometrically expensive.
+        // The pool gives the stage a memory of impacts while capping GPU cost, so the oldest marks
+        // disappear first instead of allowing thousands of overlapping decals to accumulate.
+        function createDecalMaterial() {
+            if (decalMaterial) return decalMaterial;
+            decalMaterial = new THREE.MeshStandardMaterial({
+                map: decalTexture || createFallbackParticleTexture(),
+                color: 0xf8eedc,
+                transparent: true,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -2,
+                polygonOffsetUnits: -2,
+                roughness: 0.96,
+                metalness: 0.0
+            });
+            return decalMaterial;
+        }
+
+        function disposeDecalMesh(mesh) {
+            scene.remove(mesh);
+            mesh.geometry.dispose();
+        }
+
+        function pushDecal(mesh) {
+            decalPool.push(mesh);
+            scene.add(mesh);
+            while (decalPool.length > MAX_DECALS) {
+                disposeDecalMesh(decalPool.shift());
+            }
+        }
+
+        function configureDecalProxyMesh(body) {
+            decalProxyMesh.geometry = boxGeometry;
+            decalProxyMesh.material = boxMaterial;
+            decalProxyMesh.position.set(body.position.x, body.position.y, body.position.z);
+            decalProxyMesh.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+            decalProxyMesh.scale.copy(body.userData.scale);
+            decalProxyMesh.updateMatrixWorld(true);
+            return decalProxyMesh;
+        }
+
+        function getContactWorldPoint(body, contact) {
+            const localPoint = contact.bi === body ? contact.ri : contact.rj;
+            const worldPoint = new CANNON.Vec3();
+            body.quaternion.vmult(localPoint, worldPoint);
+            worldPoint.vadd(body.position, worldPoint);
+            return new THREE.Vector3(worldPoint.x, worldPoint.y, worldPoint.z);
+        }
+
+        function getContactNormalForBody(body, contact) {
+            const normal = new CANNON.Vec3();
+            if (contact.bi === body) normal.copy(contact.ni);
+            else contact.ni.scale(-1, normal);
+            return new THREE.Vector3(normal.x, normal.y, normal.z).normalize();
+        }
+
+        function addDecalMark(targetMesh, position, normal, size) {
+            const safeNormal = normal.clone().normalize();
+            if (safeNormal.lengthSq() < 0.0001) safeNormal.set(0, 1, 0);
+            const decalPosition = position.clone().addScaledVector(safeNormal, 0.02);
+            const decalQuaternion = new THREE.Quaternion().setFromUnitVectors(
+                new THREE.Vector3(0, 0, 1),
+                safeNormal
+            );
+            const orientation = new THREE.Euler().setFromQuaternion(decalQuaternion);
+            orientation.z += Math.random() * Math.PI * 2;
+            const decalSize = new THREE.Vector3(size, size, Math.max(0.08, size * 0.35));
+            const geometry = new DecalGeometry(targetMesh, decalPosition, orientation, decalSize);
+            if (!geometry.attributes.position || geometry.attributes.position.count === 0) {
+                geometry.dispose();
+                return;
+            }
+            const decal = new THREE.Mesh(geometry, createDecalMaterial());
+            decal.renderOrder = 2;
+            pushDecal(decal);
+        }
+
+        function createFloorDecal(position, impact) {
+            const radius = THREE.MathUtils.clamp(0.32 + impact * 0.08, 0.32, 0.95);
+            const floorPos = new THREE.Vector3(position.x, 0.012, position.z);
+            addDecalMark(floorVisual, floorPos, new THREE.Vector3(0, 1, 0), radius);
+        }
+
+        function createBoxDecal(body, contact, impact) {
+            if (!boxGeometry || !body.userData?.scale) return;
+            const normal = getContactNormalForBody(body, contact);
+            const position = getContactWorldPoint(body, contact);
+            const size = THREE.MathUtils.clamp(0.22 + impact * 0.05, 0.2, 0.55);
+            addDecalMark(configureDecalProxyMesh(body), position, normal, size);
+        }
+
+        function handleBoxCollision(body, event) {
+            const impact = Math.abs(event.contact.getImpactVelocityAlongNormal());
+            if (impact < DECAL_IMPACT_THRESHOLD) return;
+
+            const now = performance.now();
+            if (now - (body.userData.lastDecalAt || 0) < 90) return;
+            body.userData.lastDecalAt = now;
+
+            const other = event.contact.bi === body ? event.contact.bj : event.contact.bi;
+            const contactPoint = getContactWorldPoint(body, event.contact);
+            triggerCollisionVisuals(impact, contactPoint);
+
+            if (other === floorBody) {
+                createFloorDecal(contactPoint, impact);
+                return;
+            }
+
+            if (other.mass === 0) return;
+
+            if (other.mass > 0 && body.id > other.id) return;
+            createBoxDecal(body, event.contact, impact);
+
+            if (other.mass > 0 && other.userData?.scale) {
+                createBoxDecal(other, event.contact, impact * 0.92);
+            }
+        }
+
+        function clearDecals() {
+            while (decalPool.length) {
+                disposeDecalMesh(decalPool.pop());
+            }
+        }
 
         function addPlacement(plan, x, z, dimensions, support = null, gapY = 0.03) {
             const y = support
@@ -668,6 +831,7 @@
             bodies.length = 0;
             initialPos.length = 0;
             instanceScales.length = 0;
+            clearDecals();
 
             const plan = [];
 
@@ -706,6 +870,10 @@
             p.userData = { life: 0, vel: new THREE.Vector3(), spin: 0 };
         }
 
+        // The particle texture loader accepts artist-provided PNGs but converts them into a usable
+        // alpha texture at runtime. This keeps the installation flexible: image assets can be
+        // sourced externally, while the code still guarantees they behave like soft chalk sprites
+        // over a black background.
         function createParticleTexture() {
             const fallbackTexture = createFallbackParticleTexture();
             const loader = new THREE.TextureLoader();
@@ -713,6 +881,11 @@
                 CHALK_DUST_TEXTURE_URL,
                 (loadedTexture) => {
                     const dustTexture = createDustTextureFromImage(loadedTexture.image);
+                    decalTexture = dustTexture;
+                    if (decalMaterial) {
+                        decalMaterial.map = dustTexture;
+                        decalMaterial.needsUpdate = true;
+                    }
                     for (const particle of particles) {
                         particle.material.map = dustTexture;
                         particle.material.needsUpdate = true;
@@ -726,6 +899,10 @@
             return fallbackTexture;
         }
 
+        // This image-processing step is the current texture-processing substitute for a custom
+        // surface shader: it derives transparency from luminance so non-transparent PNGs can still
+        // behave like additive chalk dust. In the thesis you can describe it as a material-space
+        // preprocessing stage that prepares artist assets for real-time compositing.
         function createDustTextureFromImage(image) {
             const cvs = document.createElement('canvas');
             cvs.width = image.naturalWidth || image.width;
@@ -818,6 +995,7 @@
         function triggerCollisionVisuals(impact, pos) {
             const energy = Math.min(impact / 6, 1.2);
             collisionPulse = Math.max(collisionPulse, energy);
+            spotlightImpact = Math.max(spotlightImpact, impact);
             collisionFocus.set(pos.x, pos.y + 1, pos.z);
             rimLight.position.set(pos.x + 1.8, pos.y + 3.6, pos.z + 1.8);
             rimLight.target.position.copy(collisionFocus);
@@ -904,11 +1082,19 @@
             if(done) { isResetting = false; resetMsg.style.opacity = 0; }
         }
 
-        // --- 6. IA ---
+        // --- 6. IA / MEDIAPIPE ---
+        // MediaPipe is treated as an interaction layer, not as a visual effect.
+        // Detection is throttled and converted into kinematic hand bodies so the installation
+        // remains responsive on standard laptops while still letting the physics engine handle
+        // the actual impacts. This separation is important: AI estimates intent, physics delivers
+        // believable motion.
         const video = document.getElementById("webcam");
         let landmarker;
         let lastDetectAt = 0;
 
+        // AI startup is deferred until the user explicitly begins the installation because both
+        // webcam access and model initialization are expensive. Loading them lazily reduces the
+        // chance of a heavy first frame and keeps browser permission flow predictable in exhibition.
         async function startAI() {
             try {
                 statusMain.innerText = "A carregar IA...";
@@ -928,6 +1114,8 @@
             }
         }
 
+        // MediaPipe landmarks arrive in normalized camera space. We remap them into stage space so
+        // the visitor's body becomes a physical performer inside the set, rather than a UI overlay.
         function map(lm) {
             return {
                 x: (0.5 - lm.x) * 12,
@@ -937,6 +1125,10 @@
         }
 
         let lastTime = -1;
+        // The prediction loop uses the minimum amount of AI work needed for convincing interaction.
+        // By throttling inference and deriving collider velocity from landmark deltas, the code
+        // transforms noisy pose data into impacts that feel intentional without running detection
+        // at the full render frame rate.
         async function predict() {
             const nowMs = performance.now();
             if (landmarker && video.currentTime !== lastTime && nowMs - lastDetectAt >= DETECTION_INTERVAL_MS) {
@@ -1027,7 +1219,8 @@
             else updateReset();
 
             collisionPulse *= 0.9;
-            rimLight.intensity = 8 + collisionPulse * 18;
+            spotlightImpact *= 0.88;
+            rimLight.intensity = 7 + spotlightImpact * 2.6 + collisionPulse * 10;
             fillLight.intensity = 4 + collisionPulse * 10;
             backgroundLight.intensity = 2.5 + collisionPulse * 7;
             renderer.toneMappingExposure = 1.05 + collisionPulse * 0.18;
