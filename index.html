@@ -43,6 +43,7 @@
         <div id="status-main" class="status">A aguardar início...</div>
         <div id="status-p1" class="status">P1: Ausente</div>
         <div id="status-p2" class="status">P2: Ausente</div>
+        <div id="status-debug" class="status" style="font-family: monospace; font-size: 11px; white-space: pre; line-height: 1.35;"></div>
     </div>
 
     <div id="reset-msg">⟳ A Reiniciar Ciclo ⟳</div>
@@ -62,14 +63,14 @@
         import * as THREE from 'three';
         import * as CANNON from 'cannon-es';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-        import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
         import { DecalGeometry } from 'three/addons/geometries/DecalGeometry.js';
         import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
         import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-        import { PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+        import { PoseLandmarker, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
         const statusMain = document.getElementById("status-main");
+        const statusDebug = document.getElementById("status-debug");
         const resetMsg = document.getElementById("reset-msg");
         const startBtn = document.getElementById("start-btn");
         const bgMusic = document.getElementById("bg-music");
@@ -81,12 +82,109 @@
         const MAX_DECALS = 36;
         const DECAL_IMPACT_THRESHOLD = 1.4;
 
+        // Pose landmarks are in normalized image space (x,y in ~[0,1], z a relative depth hint).
+        // Two mappings share the same formulas but different gains:
+        // - Silhouette: smaller scales so the debug stick figure does not dominate the stage.
+        // - Hands: larger scales so wrist motion sweeps a wider stage volume (farther boxes).
+        const STAGE_MAP_SILHOUETTE = { scaleX: 9, scaleY: 6, zMult: 11, zClamp: 2.4 };
+        const STAGE_MAP_HAND = { scaleX: 24, scaleY: 15, zMult: 26, zClamp: 4.2 };
+
+        // Grab/throw configuration. The closure metric runs on HandLandmarker output
+        // (21 keypoints/hand). It is the average 2D distance from the four finger tips
+        // (index 8, middle 12, ring 16, pinky 20) to the wrist (0), divided by the
+        // wrist-to-middle-MCP segment (0->9). That denominator is a stable in-frame
+        // ruler proportional to hand size, making the ratio scale-invariant.
+        //   Open hand   ~ 2.5 - 3.5
+        //   Half-curl   ~ 1.8 - 2.2
+        //   Tight fist  ~ 1.0 - 1.4
+        // FINGER_SENSITIVITY > 1 raises the thresholds, so a smaller curl already
+        // counts as a grab. Hysteresis (GRAB < RELEASE) prevents flicker.
+        // Realistic HandLandmarker closure ranges (from observation):
+        //   tight fist  ~ 0.9 - 1.25
+        //   half-curl   ~ 1.3 - 1.6
+        //   open hand   ~ 1.7 - 2.1
+        //   stretched   ~ 2.1 - 2.3 (rare)
+        // Hysteresis band must sit fully within achievable values, otherwise
+        // either grab or release becomes impossible. Old release=2.4 was the
+        // smoking gun for "boxes never release".
+        const FINGER_SENSITIVITY = 1.0;
+        // Slightly lower fist threshold = easier to enter grab; release stays clearly higher.
+        const GRAB_FIST_THRESHOLD = 1.22;
+        const GRAB_RELEASE_THRESHOLD = 1.82;
+        const HAND_MATCH_DISTANCE = 0.92;
+        const POSE_WRIST_MIN_VISIBILITY = 0.05;
+        const GRAB_REACH = 4.35;
+        const THROW_VELOCITY_MULT = 1.25;
+        const THROW_VELOCITY_CAP = 22;
+        const VELOCITY_SAMPLES = 5;
+        const HAND_COLLISION_GROUP = 2;
+        const GRAB_CONSTRAINT_FORCE = 105;
+        const HAND_DETECT_CONFIDENCE = 0.1;
+        // If HandLandmarker momentarily loses a hand we are currently grabbing
+        // with, wait this long (ms) before force-releasing, so a one-frame miss
+        // does not drop the box. Anything longer than this and the grip is
+        // considered abandoned and the box is freed defensively.
+        const GRAB_HAND_LOST_GRACE_MS = 500;
+
+        // --- STEP 3: VISUAL VARIETY CONFIG ---
+        // BoxGeometry assigns one of six material slots to each face:
+        //   0 = +x (right)   1 = -x (left)
+        //   2 = +y (top)     3 = -y (bottom)
+        //   4 = +z (front, towards camera)
+        //   5 = -z (back)
+        // Each FACE_VARIANT lists which slot indices receive the chalk drawing.
+        // The remaining slots fall back to a neutral cardboard tone, so a "1f"
+        // box reads as a single drawn surface on an otherwise blank cube.
+        const FACE_VARIANTS = [
+            { name: '1f', textured: [4] },                 // 1 face: front
+            { name: '2f', textured: [2, 4] },              // 2 faces: top + front
+            { name: '3f', textured: [0, 2, 4] },           // 3 faces: right + top + front
+            { name: '6f', textured: [0, 1, 2, 3, 4, 5] }   // all 6
+        ];
+        // Frequency of each variant; sums to 1. Most boxes get 1 or 2 textured
+        // faces; a few are fully painted (rare hero boxes that anchor the eye).
+        const FACE_VARIANT_WEIGHTS = [0.30, 0.30, 0.25, 0.15];
+
+        // Initial pose variety. Stacked boxes stay upright to preserve the pile
+        // built by the aggregation generators; only ground boxes can tilt or lie.
+        const TILT_PROBABILITY = 0.35;
+        const LYING_PROBABILITY = 0.18;
+        const TILT_MAX_RAD = 0.18; // ~10 degrees on each chosen axis
+
+        // --- STEP 4: SENSORY FEEDBACK (symbol-tagged boxes + impact audio) ---
+        // Each box gets a categorical soundSymbol picked at generation time.
+        // Weights need not sum to 1.0 — pickSoundSymbol() divides by their total.
+        // "neutral" keeps the chalk-only look — no badge, no extra stinger.
+        const SOUND_SYMBOL_WEIGHTS = {
+            water: 0.12,
+            nature: 0.12,
+            fire: 0.10,
+            light: 0.10,
+            neutral: 0.56
+        };
+        // Impact velocity (|impactAlongNormal| from Cannon) is roughly 0–15 for
+        // energetic hits. We map linearly: gain = clamp(impact * GAIN_PER_IMPACT, 0, MAX).
+        // That makes perceived loudness strictly proportional to hit strength until the cap.
+        const IMPACT_AUDIO_MIN = 0.16;          // low floor so slides / pushes still whisper
+        const IMPACT_LINEAR_REF = 9.5;        // impact at which scream layer reaches full normalised 1.0
+        const IMPACT_GAIN_PER_UNIT = 0.11;    // linear slope: gain = impact * this (before cap)
+        const IMPACT_GAIN_CAP = 0.95;         // hard ceiling so the WebAudio graph never clips nastily
+        const SYMBOL_STINGER_GAIN_SCALE = 0.145; // themed layer (ducked scream when symbols hit)
+
         // --- 0. AUDIO (Sintetizador + Video MOV) ---
         let audioCtx;
+
+        /** Browsers start AudioContext suspended until a user gesture; resume once. */
+        function ensureAudioContextRunning() {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+        }
+
         startBtn.addEventListener('click', () => {
             try {
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                
+                ensureAudioContextRunning();
+
                 // Tenta tocar o ficheiro MOV
                 bgMusic.play().then(() => {
                     console.log("Audio de fundo iniciado");
@@ -102,36 +200,336 @@
             }
         });
 
-        function playSound(velocity) {
+        // --- Step 4 WebAudio helpers (procedural: no external .wav required) ---
+        function pickSoundSymbol() {
+            const w = SOUND_SYMBOL_WEIGHTS;
+            const order = ['water', 'nature', 'fire', 'light', 'neutral'];
+            let sum = 0;
+            for (const k of order) sum += w[k] || 0;
+            let r = Math.random() * sum;
+            for (const k of order) {
+                r -= w[k] || 0;
+                if (r <= 0) return k;
+            }
+            return 'neutral';
+        }
+
+        /** Maps physics impact to a 0..1 linear factor (strictly proportional to impact until REF). */
+        function impactToLinearGainFactor(impact) {
+            if (impact < IMPACT_AUDIO_MIN) return 0;
+            return Math.min(impact / IMPACT_LINEAR_REF, 1);
+        }
+
+        /**
+         * getImpactVelocityAlongNormal() is often tiny during sustained pushes
+         * (e.g. kinematic hand sliding on a box). Blend in closing speed from the
+         * two bodies' world linear velocities so shoves still trigger audio, not only taps.
+         */
+        function effectiveImpactFromContact(contact) {
+            let imp = Math.abs(contact.getImpactVelocityAlongNormal());
+            const bi = contact.bi;
+            const bj = contact.bj;
+            if (!bi || !bj) return Math.min(24, imp);
+            const rel = new CANNON.Vec3();
+            bi.velocity.vsub(bj.velocity, rel);
+            const closing = Math.abs(rel.dot(contact.ni));
+            return Math.min(24, Math.max(imp, closing * 0.42));
+        }
+
+        /**
+         * Generic impact layer: band-limited noise (body hit). gainMul lets us duck
+         * this layer when a themed symbol stinger plays so water/fire/etc. read clearly.
+         */
+        function playImpactScreamLinear(impact, opts = {}) {
             if (!audioCtx) return;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.connect(gain);
-            gain.connect(audioCtx.destination);
-            
-            const intensity = Math.min(velocity / 8, 1);
-            
-            // Som mais "dark" e percussivo para combinar com o visual
-            osc.type = 'triangle';
-            osc.frequency.setValueAtTime(80 + (intensity * 50), audioCtx.currentTime);
-            osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.2);
-            
-            gain.gain.setValueAtTime(0, audioCtx.currentTime);
-            gain.gain.linearRampToValueAtTime(intensity * 0.3, audioCtx.currentTime + 0.02);
-            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
-            
-            osc.start();
-            osc.stop(audioCtx.currentTime + 0.4);
+            ensureAudioContextRunning();
+            const factor = impactToLinearGainFactor(impact);
+            if (factor <= 0) return;
+
+            const gainMul = opts.gainMul ?? 1;
+            const peakGain = Math.min(impact * IMPACT_GAIN_PER_UNIT * gainMul, IMPACT_GAIN_CAP);
+            const t0 = audioCtx.currentTime;
+            const dur = 0.2 + factor * 0.09;
+
+            const frames = Math.max(256, Math.floor(audioCtx.sampleRate * dur));
+            const buffer = audioCtx.createBuffer(1, frames, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < frames; i++) {
+                const fade = 1 - i / frames;
+                data[i] = (Math.random() * 2 - 1) * fade * fade;
+            }
+            const src = audioCtx.createBufferSource();
+            src.buffer = buffer;
+
+            const bp = audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.setValueAtTime(720 + factor * 1100, t0);
+            bp.Q.setValueAtTime(1.15 + factor * 0.5, t0);
+
+            const g = audioCtx.createGain();
+            src.connect(bp);
+            bp.connect(g);
+            g.connect(audioCtx.destination);
+
+            g.gain.setValueAtTime(0, t0);
+            g.gain.linearRampToValueAtTime(peakGain, t0 + 0.01);
+            g.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+
+            src.start(t0);
+            src.stop(t0 + dur + 0.02);
+        }
+
+        /** Water: resonant drips + filtered wash (liquid / bubble read). */
+        function playWaterSymbolStinger(impact) {
+            if (!audioCtx) return;
+            ensureAudioContextRunning();
+            const factor = impactToLinearGainFactor(impact);
+            if (factor <= 0) return;
+            const peak = factor * SYMBOL_STINGER_GAIN_SCALE * 1.35;
+            const t0 = audioCtx.currentTime;
+
+            const durWash = 0.19;
+            const frW = Math.floor(audioCtx.sampleRate * durWash);
+            const bufW = audioCtx.createBuffer(1, frW, audioCtx.sampleRate);
+            const dW = bufW.getChannelData(0);
+            for (let i = 0; i < frW; i++) {
+                const e = Math.sin((i / frW) * Math.PI);
+                dW[i] = (Math.random() * 2 - 1) * e * 0.55;
+            }
+            const srcW = audioCtx.createBufferSource();
+            srcW.buffer = bufW;
+            const lpW = audioCtx.createBiquadFilter();
+            lpW.type = 'lowpass';
+            lpW.frequency.setValueAtTime(1200, t0);
+            const pk = audioCtx.createBiquadFilter();
+            pk.type = 'peaking';
+            pk.frequency.setValueAtTime(480, t0);
+            pk.Q.setValueAtTime(0.85, t0);
+            pk.gain.setValueAtTime(9, t0);
+            const gW = audioCtx.createGain();
+            srcW.connect(lpW);
+            lpW.connect(pk);
+            pk.connect(gW);
+            gW.connect(audioCtx.destination);
+            gW.gain.setValueAtTime(0, t0);
+            gW.gain.linearRampToValueAtTime(peak * 0.38, t0 + 0.02);
+            gW.gain.linearRampToValueAtTime(0.0001, t0 + durWash);
+            srcW.start(t0);
+            srcW.stop(t0 + durWash + 0.02);
+
+            const drops = [[0, 320, 200], [0.052, 395, 215], [0.098, 275, 165]];
+            for (const [delay, f0, f1] of drops) {
+                const osc = audioCtx.createOscillator();
+                osc.type = 'sine';
+                const t = t0 + delay;
+                osc.frequency.setValueAtTime(f0, t);
+                osc.frequency.exponentialRampToValueAtTime(Math.max(f1, 45), t + 0.095);
+                const gg = audioCtx.createGain();
+                osc.connect(gg);
+                gg.connect(audioCtx.destination);
+                gg.gain.setValueAtTime(0, t);
+                gg.gain.linearRampToValueAtTime(peak * 0.52, t + 0.004);
+                gg.gain.linearRampToValueAtTime(0.0001, t + 0.11);
+                osc.start(t);
+                osc.stop(t + 0.12);
+            }
+        }
+
+        /** Nature: filtered wind bed + short high chirps (birds in foliage). */
+        function playNatureSymbolStinger(impact) {
+            if (!audioCtx) return;
+            ensureAudioContextRunning();
+            const factor = impactToLinearGainFactor(impact);
+            if (factor <= 0) return;
+            const peak = factor * SYMBOL_STINGER_GAIN_SCALE * 1.28;
+            const t0 = audioCtx.currentTime;
+
+            const dur = 0.3;
+            const fr = Math.floor(audioCtx.sampleRate * dur);
+            const buf = audioCtx.createBuffer(1, fr, audioCtx.sampleRate);
+            const data = buf.getChannelData(0);
+            let last = 0;
+            for (let i = 0; i < fr; i++) {
+                const white = Math.random() * 2 - 1;
+                last = last * 0.91 + white * 0.09;
+                const e = Math.pow(1 - i / fr, 0.38);
+                data[i] = last * e;
+            }
+            const src = audioCtx.createBufferSource();
+            src.buffer = buf;
+            const bp = audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.setValueAtTime(380, t0);
+            bp.Q.setValueAtTime(0.42, t0);
+            const g = audioCtx.createGain();
+            src.connect(bp);
+            bp.connect(g);
+            g.connect(audioCtx.destination);
+            g.gain.setValueAtTime(0, t0);
+            g.gain.linearRampToValueAtTime(peak * 0.52, t0 + 0.06);
+            g.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+            src.start(t0);
+            src.stop(t0 + dur + 0.02);
+
+            const chirps = [[0.075, 2180, 1580], [0.145, 2550, 1880], [0.218, 2320, 1720]];
+            for (const [delay, f0, f1] of chirps) {
+                const o = audioCtx.createOscillator();
+                o.type = 'sine';
+                const t = t0 + delay;
+                o.frequency.setValueAtTime(f0, t);
+                o.frequency.exponentialRampToValueAtTime(Math.max(f1, 90), t + 0.03);
+                const gg = audioCtx.createGain();
+                o.connect(gg);
+                gg.connect(audioCtx.destination);
+                gg.gain.setValueAtTime(0, t);
+                gg.gain.linearRampToValueAtTime(peak * 0.36, t + 0.002);
+                gg.gain.linearRampToValueAtTime(0.0001, t + 0.058);
+                o.start(t);
+                o.stop(t + 0.065);
+            }
+        }
+
+        /** Fire: low saw combustion + fast upward crackle (heat + embers). */
+        function playFireSymbolStinger(impact) {
+            if (!audioCtx) return;
+            ensureAudioContextRunning();
+            const factor = impactToLinearGainFactor(impact);
+            if (factor <= 0) return;
+            const peak = factor * SYMBOL_STINGER_GAIN_SCALE * 1.38;
+            const t0 = audioCtx.currentTime;
+
+            const body = audioCtx.createOscillator();
+            body.type = 'sawtooth';
+            body.frequency.setValueAtTime(62 + factor * 20, t0);
+            body.frequency.linearRampToValueAtTime(40, t0 + 0.17);
+            const flp = audioCtx.createBiquadFilter();
+            flp.type = 'lowpass';
+            flp.frequency.setValueAtTime(480, t0);
+            const bg = audioCtx.createGain();
+            body.connect(flp);
+            flp.connect(bg);
+            bg.connect(audioCtx.destination);
+            bg.gain.setValueAtTime(0, t0);
+            bg.gain.linearRampToValueAtTime(peak * 0.4, t0 + 0.018);
+            bg.gain.linearRampToValueAtTime(0.0001, t0 + 0.18);
+            body.start(t0);
+            body.stop(t0 + 0.19);
+
+            const dur = 0.12;
+            const frames = Math.floor(audioCtx.sampleRate * dur);
+            const buffer = audioCtx.createBuffer(1, frames, audioCtx.sampleRate);
+            const d = buffer.getChannelData(0);
+            for (let i = 0; i < frames; i++) {
+                const e = Math.pow(1 - i / frames, 2.1);
+                d[i] = (Math.random() * 2 - 1) * e;
+            }
+            const src = audioCtx.createBufferSource();
+            src.buffer = buffer;
+            const bp = audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.setValueAtTime(850, t0);
+            bp.frequency.linearRampToValueAtTime(3600, t0 + dur);
+            bp.Q.setValueAtTime(2.1, t0);
+            const g = audioCtx.createGain();
+            src.connect(bp);
+            bp.connect(g);
+            g.connect(audioCtx.destination);
+            g.gain.setValueAtTime(0, t0);
+            g.gain.linearRampToValueAtTime(peak * 0.62, t0 + 0.003);
+            g.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+            src.start(t0);
+            src.stop(t0 + dur + 0.02);
+        }
+
+        /** Light: inharmonic chime (sparkle) + low filtered thunder roll. */
+        function playLightSymbolStinger(impact) {
+            if (!audioCtx) return;
+            ensureAudioContextRunning();
+            const factor = impactToLinearGainFactor(impact);
+            if (factor <= 0) return;
+            const peak = factor * SYMBOL_STINGER_GAIN_SCALE * 1.32;
+            const t0 = audioCtx.currentTime;
+
+            const ratios = [1, 1.21, 1.47, 1.89];
+            const base = 900 + factor * 240;
+            const bus = audioCtx.createGain();
+            bus.connect(audioCtx.destination);
+            bus.gain.setValueAtTime(1, t0);
+            for (let i = 0; i < ratios.length; i++) {
+                const o = audioCtx.createOscillator();
+                o.type = 'triangle';
+                const f = base * ratios[i];
+                o.frequency.setValueAtTime(f, t0);
+                o.frequency.linearRampToValueAtTime(f * 0.93, t0 + 0.06);
+                const gg = audioCtx.createGain();
+                o.connect(gg);
+                gg.connect(bus);
+                const part = peak * (0.2 + 0.07 * (1 - i / ratios.length));
+                gg.gain.setValueAtTime(0, t0);
+                gg.gain.linearRampToValueAtTime(part, t0 + 0.003 + i * 0.004);
+                gg.gain.linearRampToValueAtTime(0.0001, t0 + 0.38);
+                o.start(t0);
+                o.stop(t0 + 0.39);
+            }
+
+            const dur = 0.22;
+            const fr = Math.floor(audioCtx.sampleRate * dur);
+            const buf = audioCtx.createBuffer(1, fr, audioCtx.sampleRate);
+            const d = buf.getChannelData(0);
+            for (let i = 0; i < fr; i++) {
+                const e = (1 - i / fr) * (1 - i / fr);
+                d[i] = (Math.random() * 2 - 1) * e;
+            }
+            const ns = audioCtx.createBufferSource();
+            ns.buffer = buf;
+            const lp = audioCtx.createBiquadFilter();
+            lp.type = 'lowpass';
+            lp.frequency.setValueAtTime(105, t0 + 0.05);
+            lp.frequency.linearRampToValueAtTime(48, t0 + dur);
+            const rg = audioCtx.createGain();
+            ns.connect(lp);
+            lp.connect(rg);
+            rg.connect(audioCtx.destination);
+            rg.gain.setValueAtTime(0, t0 + 0.038);
+            rg.gain.linearRampToValueAtTime(peak * 0.72, t0 + 0.075);
+            rg.gain.linearRampToValueAtTime(0.0001, t0 + dur);
+            ns.start(t0);
+            ns.stop(t0 + dur + 0.02);
+        }
+
+        function playSymbolStingerForBody(body, impact) {
+            const sym = body.userData?.soundSymbol;
+            if (sym === 'water') playWaterSymbolStinger(impact);
+            else if (sym === 'nature') playNatureSymbolStinger(impact);
+            else if (sym === 'fire') playFireSymbolStinger(impact);
+            else if (sym === 'light') playLightSymbolStinger(impact);
+        }
+
+        /**
+         * One physical hit → scream (ducked if a themed box is involved) + symbol stingers.
+         */
+        function playFullCollisionAudio(bodyA, bodyB, impact) {
+            const symA = bodyA?.userData?.soundSymbol;
+            const symB = bodyB?.userData?.soundSymbol;
+            const themed = (symA && symA !== 'neutral') || (symB && symB !== 'neutral');
+            playImpactScreamLinear(impact, { gainMul: themed ? 0.5 : 1 });
+            playSymbolStingerForBody(bodyA, impact);
+            if (bodyB && bodyB.mass > 0) playSymbolStingerForBody(bodyB, impact * 0.92);
+        }
+
+        /** Kept for any legacy call sites — forwards to the new linear scream. */
+        function playSound(velocity) {
+            playImpactScreamLinear(velocity);
         }
 
         // --- 1. CENA 3D & RASTO ---
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x050505); // Fundo quase preto
-        scene.fog = new THREE.Fog(0x050505, 9, 22);
+        scene.fog = new THREE.Fog(0x050505, 12, 30);
 
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
-        camera.position.set(0, 4, 9); 
-        camera.lookAt(0, 1, 0);
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 120);
+        camera.position.set(0, 4.6, 11.8);
+        camera.lookAt(0, 1.1, 0);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: false });
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
@@ -151,7 +549,7 @@
             opacity: 0.15,
             depthTest: false
         });
-        const fadePlane = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), fadeMaterial);
+        const fadePlane = new THREE.Mesh(new THREE.PlaneGeometry(28, 28), fadeMaterial);
         fadePlane.position.z = -0.1; 
         fadePlane.renderOrder = -1; 
         camera.add(fadePlane);
@@ -165,24 +563,24 @@
         keyLight.castShadow = true;
         keyLight.shadow.mapSize.set(2048, 2048);
         keyLight.shadow.camera.near = 0.5;
-        keyLight.shadow.camera.far = 35;
-        keyLight.shadow.camera.left = -10;
-        keyLight.shadow.camera.right = 10;
-        keyLight.shadow.camera.top = 10;
-        keyLight.shadow.camera.bottom = -10;
+        keyLight.shadow.camera.far = 45;
+        keyLight.shadow.camera.left = -14;
+        keyLight.shadow.camera.right = 14;
+        keyLight.shadow.camera.top = 14;
+        keyLight.shadow.camera.bottom = -14;
         scene.add(keyLight);
 
-        const rimLight = new THREE.SpotLight(0x7fb3ff, 20, 30, Math.PI / 7, 0.35, 1.2);
+        const rimLight = new THREE.SpotLight(0x7fb3ff, 20, 38, Math.PI / 7, 0.35, 1.2);
         rimLight.position.set(-5, 6, -3);
         rimLight.target.position.set(0, 2, 0);
         scene.add(rimLight);
         scene.add(rimLight.target);
 
-        const fillLight = new THREE.PointLight(0xff7a3d, 8, 18, 2);
+        const fillLight = new THREE.PointLight(0xff7a3d, 8, 24, 2);
         fillLight.position.set(0, 3, 5);
         scene.add(fillLight);
 
-        const backgroundLight = new THREE.PointLight(0x4fd8ff, 2.5, 24, 2);
+        const backgroundLight = new THREE.PointLight(0x4fd8ff, 2.5, 32, 2);
         backgroundLight.position.set(0, 5, -7);
         scene.add(backgroundLight);
 
@@ -232,17 +630,22 @@
         world.defaultContactMaterial.frictionEquationRelaxation = 4;
 
         // Physics and rendering stay separated on purpose:
-        // bodies = simulation truth, initialPos = reset targets, instanceScales = visual scaling
-        // data for InstancedMesh. This split keeps Cannon authoritative while allowing a very
-        // cheap render path on the GPU.
-        const bodies = [], initialPos = [], instanceScales = [];
+        // bodies = simulation truth, initialPos / initialQuats = reset targets,
+        // instanceScales = visual scaling data for InstancedMesh. This split keeps
+        // Cannon authoritative while allowing a very cheap render path on the GPU.
+        const bodies = [], initialPos = [], initialQuats = [], instanceScales = [];
         const gltfLoader = new GLTFLoader();
         const boxSize = 1;
         let modelBaseSize = null;
         let sharedBoxTexture = null;
-        let boxGeometry = null;
-        let boxMaterial = null;
-        let boxInstancedMesh = null;
+        let boxGeometry = null;            // unit BoxGeometry (1x1x1) with 6 face groups
+        let boxMaterial = null;            // alias kept for the decal proxy mesh
+        let texturedFaceMaterial = null;   // chalk drawing material (artist texture)
+        let neutralFaceMaterial = null;    // blank cardboard material
+        let variantMaterialsArrays = null; // FACE_VARIANTS.length 6-element arrays
+        let boxInstancedMeshes = null;     // one InstancedMesh per face variant
+        // Reused per-frame dirty bitmap so the render loop never allocates.
+        const boxInstancedMeshesDirtyScratch = new Array(FACE_VARIANTS.length).fill(false);
         let collisionPulse = 0;
         let spotlightImpact = 0;
         let decalTexture = null;
@@ -251,8 +654,252 @@
         const instanceDummy = new THREE.Object3D();
         const decalPool = [];
         const decalProxyMesh = new THREE.Mesh();
+        // Step 4: small badge planes (shared geometry + four symbol materials) sit slightly
+        // outside each tagged box's local +Z face; they are *not* instanced with the pile.
+        const symbolBadgeOffsetLocal = new THREE.Vector3();
+        const symbolBadgeWorldOffset = new THREE.Vector3();
+        let symbolBadgeGeometry = null;
+        let symbolWaterMaterial = null;
+        let symbolNatureMaterial = null;
+        let symbolFireMaterial = null;
+        let symbolLightMaterial = null;
 
-        // --- TEXTURA ESTILO DIOGO (PRETO E GIZ) ---
+        function canvasTextureFromCanvas(canvas) {
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.needsUpdate = true;
+            return tex;
+        }
+
+        function makeWaterSymbolCanvas() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const grd = ctx.createLinearGradient(0, 0, 128, 128);
+            grd.addColorStop(0, '#1f9ae6');
+            grd.addColorStop(1, '#063056');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, 128, 128);
+            ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+            ctx.lineWidth = 8;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(10, 76);
+            ctx.bezierCurveTo(38, 38, 54, 108, 66, 72);
+            ctx.bezierCurveTo(78, 40, 96, 100, 118, 58);
+            ctx.stroke();
+            ctx.strokeStyle = 'rgba(210, 245, 255, 0.55)';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.arc(90, 36, 9, 0.3, Math.PI * 1.7);
+            ctx.stroke();
+            return c;
+        }
+
+        function makeNatureSymbolCanvas() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const grd = ctx.createLinearGradient(0, 128, 128, 0);
+            grd.addColorStop(0, '#174a24');
+            grd.addColorStop(1, '#45c96a');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, 128, 128);
+            ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+            ctx.lineWidth = 3;
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(64, 104);
+            ctx.quadraticCurveTo(32, 70, 40, 36);
+            ctx.quadraticCurveTo(64, 18, 88, 36);
+            ctx.quadraticCurveTo(96, 70, 64, 104);
+            ctx.closePath();
+            ctx.stroke();
+            ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(64, 78);
+            ctx.quadraticCurveTo(50, 52, 42, 38);
+            ctx.stroke();
+            return c;
+        }
+
+        function makeFireSymbolCanvas() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const grd = ctx.createRadialGradient(52, 88, 8, 64, 72, 70);
+            grd.addColorStop(0, '#fff4a8');
+            grd.addColorStop(0.25, '#ff9a2e');
+            grd.addColorStop(0.55, '#e84b17');
+            grd.addColorStop(1, '#3a0a06');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, 128, 128);
+            ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+            ctx.lineWidth = 3;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(44, 96);
+            ctx.quadraticCurveTo(38, 52, 58, 36);
+            ctx.quadraticCurveTo(78, 22, 88, 44);
+            ctx.quadraticCurveTo(98, 68, 72, 96);
+            ctx.quadraticCurveTo(56, 108, 44, 96);
+            ctx.stroke();
+            ctx.strokeStyle = 'rgba(255,220,160,0.55)';
+            ctx.lineWidth = 5;
+            ctx.beginPath();
+            ctx.moveTo(52, 100);
+            ctx.quadraticCurveTo(64, 48, 82, 40);
+            ctx.stroke();
+            return c;
+        }
+
+        function makeLightSymbolCanvas() {
+            const c = document.createElement('canvas');
+            c.width = c.height = 128;
+            const ctx = c.getContext('2d');
+            const grd = ctx.createRadialGradient(64, 64, 4, 64, 64, 72);
+            grd.addColorStop(0, '#ffffff');
+            grd.addColorStop(0.12, '#fff8c4');
+            grd.addColorStop(0.35, '#ffd54a');
+            grd.addColorStop(0.7, '#6a4fb8');
+            grd.addColorStop(1, '#1a1033');
+            ctx.fillStyle = grd;
+            ctx.fillRect(0, 0, 128, 128);
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+            ctx.lineWidth = 3;
+            for (let i = 0; i < 10; i++) {
+                const ang = (i / 10) * Math.PI * 2 + 0.2;
+                ctx.beginPath();
+                ctx.moveTo(64, 64);
+                ctx.lineTo(64 + Math.cos(ang) * 52, 64 + Math.sin(ang) * 52);
+                ctx.stroke();
+            }
+            ctx.fillStyle = 'rgba(255,255,255,0.95)';
+            ctx.beginPath();
+            ctx.arc(64, 64, 10, 0, Math.PI * 2);
+            ctx.fill();
+            return c;
+        }
+
+        function ensureSymbolBadgeMaterials() {
+            if (symbolBadgeGeometry) return;
+            symbolBadgeGeometry = new THREE.PlaneGeometry(0.44, 0.44);
+            // BasicMaterial: no per-fragment lighting math — enough for flat icon cards.
+            symbolWaterMaterial = new THREE.MeshBasicMaterial({
+                map: canvasTextureFromCanvas(makeWaterSymbolCanvas()),
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -1
+            });
+            symbolNatureMaterial = new THREE.MeshBasicMaterial({
+                map: canvasTextureFromCanvas(makeNatureSymbolCanvas()),
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -1
+            });
+            symbolFireMaterial = new THREE.MeshBasicMaterial({
+                map: canvasTextureFromCanvas(makeFireSymbolCanvas()),
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -1
+            });
+            symbolLightMaterial = new THREE.MeshBasicMaterial({
+                map: canvasTextureFromCanvas(makeLightSymbolCanvas()),
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -1
+            });
+        }
+
+        function attachSymbolBadgeToBody(body) {
+            const tag = body.userData?.soundSymbol;
+            ensureSymbolBadgeMaterials();
+            const matByTag = {
+                water: symbolWaterMaterial,
+                nature: symbolNatureMaterial,
+                fire: symbolFireMaterial,
+                light: symbolLightMaterial
+            };
+            const mat = matByTag[tag];
+            if (!mat) return;
+            const mesh = new THREE.Mesh(symbolBadgeGeometry, mat);
+            mesh.castShadow = false;
+            mesh.receiveShadow = false;
+            mesh.renderOrder = 6;
+            mesh.frustumCulled = false;
+            scene.add(mesh);
+            body.userData.symbolMesh = mesh;
+        }
+
+        function disposeAllSymbolBadgeMeshes() {
+            for (const body of bodies) {
+                const sm = body.userData?.symbolMesh;
+                if (!sm) continue;
+                scene.remove(sm);
+                body.userData.symbolMesh = null;
+            }
+            if (symbolBadgeGeometry) {
+                symbolBadgeGeometry.dispose();
+                symbolBadgeGeometry = null;
+            }
+            if (symbolWaterMaterial) {
+                if (symbolWaterMaterial.map) symbolWaterMaterial.map.dispose();
+                symbolWaterMaterial.dispose();
+                symbolWaterMaterial = null;
+            }
+            if (symbolNatureMaterial) {
+                if (symbolNatureMaterial.map) symbolNatureMaterial.map.dispose();
+                symbolNatureMaterial.dispose();
+                symbolNatureMaterial = null;
+            }
+            if (symbolFireMaterial) {
+                if (symbolFireMaterial.map) symbolFireMaterial.map.dispose();
+                symbolFireMaterial.dispose();
+                symbolFireMaterial = null;
+            }
+            if (symbolLightMaterial) {
+                if (symbolLightMaterial.map) symbolLightMaterial.map.dispose();
+                symbolLightMaterial.dispose();
+                symbolLightMaterial = null;
+            }
+        }
+
+        function updateSymbolBadgeMeshes() {
+            for (const body of bodies) {
+                const sm = body.userData?.symbolMesh;
+                if (!sm) continue;
+                // Sleeping bodies keep a fixed pose; skipping saves CPU on settled piles.
+                if (body.sleepState === CANNON.Body.SLEEPING) continue;
+                const shape = body.shapes?.[0];
+                const hz = shape?.halfExtents?.z;
+                if (hz == null) continue;
+                symbolBadgeOffsetLocal.set(0, 0.07 * (body.userData.scale?.y ?? 1), hz + 0.045);
+                body.quaternion.vmult(symbolBadgeOffsetLocal, symbolBadgeWorldOffset);
+                sm.position.set(
+                    body.position.x + symbolBadgeWorldOffset.x,
+                    body.position.y + symbolBadgeWorldOffset.y,
+                    body.position.z + symbolBadgeWorldOffset.z
+                );
+                sm.quaternion.set(
+                    body.quaternion.x,
+                    body.quaternion.y,
+                    body.quaternion.z,
+                    body.quaternion.w
+                );
+                const sc = body.userData.scale;
+                const k = (Math.min(sc.x, sc.y, sc.z) * 0.92) + 0.16;
+                sm.scale.setScalar(k);
+            }
+        }
         // Aqui está a função completa que tinhas pedido
         function getCardboardTex() {
             const cvs = document.createElement('canvas'); 
@@ -317,112 +964,98 @@
             return new THREE.CanvasTexture(cvs);
         }
 
-        // The material pipeline preserves the authored Blender look whenever possible.
-        // Earlier experiments used more procedural shading, but the final installation favors
-        // fidelity to the original cube artwork, then normalizes color space/anisotropy so the
-        // same asset remains legible under strong bloom and dark stage lighting.
-        function applyModelMaterial(root) {
-            root.traverse((child) => {
-                if (!child.isMesh) return;
-                child.castShadow = true;
-                child.receiveShadow = true;
-                const sourceMaterial = Array.isArray(child.material) ? child.material[0] : child.material;
-                child.material = sourceMaterial
-                    ? sourceMaterial.clone()
-                    : new THREE.MeshStandardMaterial({
-                        map: sharedBoxTexture,
-                        color: 0xffffff,
-                        roughness: 0.82,
-                        metalness: 0.08,
-                        envMapIntensity: 0.4
-                    });
-                if (child.material.map) {
-                    child.material.map.colorSpace = THREE.SRGBColorSpace;
-                    child.material.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        // InstancedMesh shares one geometry + one materials array across instances.
+        // Per-face variety therefore requires one InstancedMesh per face-pattern
+        // variant (we picked four). We dispose every previous mesh on rebuild so
+        // textures and GPU buffers are released cleanly between resets.
+        function createInstancedMeshesForCounts(counts) {
+            if (boxInstancedMeshes) {
+                for (const m of boxInstancedMeshes) {
+                    if (!m) continue;
+                    scene.remove(m);
+                    if (m.dispose) m.dispose();
                 }
-                child.material.needsUpdate = true;
-            });
-        }
-
-        // InstancedMesh is the core performance optimization of the installation.
-        // Instead of cloning one full Three.js hierarchy per box, we upload one geometry/material
-        // pair and vary only the transform matrix per instance. This keeps Cannon bodies
-        // independent while collapsing rendering into a much smaller number of draw calls.
-        function createInstancedBoxes(count) {
-            if (boxInstancedMesh) {
-                scene.remove(boxInstancedMesh);
             }
-
-            boxInstancedMesh = new THREE.InstancedMesh(boxGeometry, boxMaterial, count);
-            boxInstancedMesh.castShadow = true;
-            boxInstancedMesh.receiveShadow = true;
-            boxInstancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-            boxInstancedMesh.frustumCulled = false;
-            scene.add(boxInstancedMesh);
+            boxInstancedMeshes = FACE_VARIANTS.map((_, vIdx) => {
+                const count = counts[vIdx] || 0;
+                if (count === 0) return null;
+                const mesh = new THREE.InstancedMesh(
+                    boxGeometry,
+                    variantMaterialsArrays[vIdx],
+                    count
+                );
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+                mesh.frustumCulled = false;
+                scene.add(mesh);
+                return mesh;
+            });
         }
 
-        // The imported GLB is normalized once and merged into a single renderable geometry.
-        // Doing this upfront avoids paying the cost of traversing/cloning a complex 5MB model
-        // for every box at runtime, which is especially important because MediaPipe and bloom
-        // are already sharing the same laptop GPU budget.
+        // Phase 1 of Step 3: instead of merging the GLB into one shared geometry,
+        // we extract its texture (so the artist's chalk drawing is preserved) and
+        // wrap it on a procedural unit BoxGeometry. BoxGeometry exposes 6 face
+        // groups out of the box, which is what enables per-face material control.
         async function loadBoxModel() {
-            if (boxGeometry && boxMaterial && modelBaseSize) return;
-            sharedBoxTexture = sharedBoxTexture || getCardboardTex();
+            if (variantMaterialsArrays && modelBaseSize) return;
 
-            const gltf = await gltfLoader.loadAsync('cube.glb?v=3');
-            const root = gltf.scene;
-            const bounds = new THREE.Box3().setFromObject(root);
-            const size = new THREE.Vector3();
-            const center = new THREE.Vector3();
-            bounds.getSize(size);
-            bounds.getCenter(center);
+            // 1. Source the chalk-drawing texture. We try the GLB first to keep
+            //    the original artist-authored map, and fall back to the procedural
+            //    cardboard canvas if the GLB cannot be loaded.
+            let extractedTexture = null;
+            try {
+                const gltf = await gltfLoader.loadAsync('cube.glb?v=3');
+                gltf.scene.traverse((child) => {
+                    if (extractedTexture) return;
+                    if (!child.isMesh) return;
+                    const m = Array.isArray(child.material) ? child.material[0] : child.material;
+                    if (m && m.map) extractedTexture = m.map;
+                });
+            } catch (err) {
+                console.warn("[step3] cube.glb could not be loaded; using procedural chalk texture only.", err);
+            }
+            if (!extractedTexture) extractedTexture = getCardboardTex();
+            sharedBoxTexture = extractedTexture;
+            sharedBoxTexture.colorSpace = THREE.SRGBColorSpace;
+            sharedBoxTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            sharedBoxTexture.needsUpdate = true;
 
-            const maxAxis = Math.max(size.x, size.y, size.z) || 1;
-            const scale = boxSize / maxAxis;
-            root.scale.setScalar(scale);
-            root.position.sub(center.multiplyScalar(scale));
-            applyModelMaterial(root);
-            root.updateMatrixWorld(true);
+            // 2. Procedural unit cube. Each face maps 1:1 to one of the six
+            //    material slots (BoxGeometry generates "groups" automatically).
+            //    Per-instance scaling later turns this into pillars/blocks.
+            boxGeometry = new THREE.BoxGeometry(1, 1, 1);
+            boxGeometry.computeBoundingBox();
+            boxGeometry.computeBoundingSphere();
 
-            const mergedGeometries = [];
-            let mergedMaterial = null;
-            root.traverse((child) => {
-                if (!child.isMesh) return;
-                const geometry = child.geometry.clone();
-                geometry.applyMatrix4(child.matrixWorld);
-                mergedGeometries.push(geometry);
-
-                if (!mergedMaterial) {
-                    const material = Array.isArray(child.material) ? child.material[0] : child.material;
-                    mergedMaterial = material.clone();
-                }
-            });
-
-            const mergedGeometry = mergedGeometries.length === 1
-                ? mergedGeometries[0]
-                : mergeGeometries(mergedGeometries, false);
-            mergedGeometry.computeBoundingBox();
-            const mergedBounds = mergedGeometry.boundingBox;
-            const mergedCenter = mergedBounds.getCenter(new THREE.Vector3());
-            const mergedSize = mergedBounds.getSize(new THREE.Vector3());
-            mergedGeometry.translate(-mergedCenter.x, -mergedCenter.y, -mergedCenter.z);
-            mergedGeometry.computeVertexNormals();
-            mergedGeometry.computeBoundingSphere();
-
-            boxGeometry = mergedGeometry;
-            boxMaterial = mergedMaterial || new THREE.MeshStandardMaterial({
+            // 3. The two physical-looking materials we mix per variant.
+            texturedFaceMaterial = new THREE.MeshStandardMaterial({
                 map: sharedBoxTexture,
                 color: 0xffffff,
                 roughness: 0.82,
                 metalness: 0.08,
                 envMapIntensity: 0.4
             });
-            if (boxMaterial.map) {
-                boxMaterial.map.colorSpace = THREE.SRGBColorSpace;
-                boxMaterial.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
-            }
-            boxMaterial.needsUpdate = true;
-            modelBaseSize = mergedSize;
+            neutralFaceMaterial = new THREE.MeshStandardMaterial({
+                color: 0x1f1d1a,
+                roughness: 0.95,
+                metalness: 0.04,
+                envMapIntensity: 0.30
+            });
+
+            // 4. Pre-build a 6-slot materials array per variant. We reuse the
+            //    same two material instances across all variants and across all
+            //    InstancedMesh objects, so total live materials stay at exactly 2.
+            variantMaterialsArrays = FACE_VARIANTS.map((v) => {
+                const arr = new Array(6).fill(neutralFaceMaterial);
+                for (const idx of v.textured) arr[idx] = texturedFaceMaterial;
+                return arr;
+            });
+
+            // The decal proxy mesh expects boxGeometry + boxMaterial on its mesh
+            // properties. Keeping a singular alias avoids touching that path.
+            boxMaterial = neutralFaceMaterial;
+            modelBaseSize = new THREE.Vector3(1, 1, 1);
         }
 
         function randomStageDimensions(kind = 'mixed') {
@@ -448,7 +1081,8 @@
         // Each scenic element still gets its own Cannon body even though rendering is instanced.
         // This keeps collisions believable and lets each box receive decals, sleep, reset and be
         // pushed independently, while the visual layer stays lightweight.
-        function createBox(x, y, z, dimensions) {
+        // opts: { variantIdx, instanceIdxInVariant, initialQuat, soundSymbol }
+        function createBox(x, y, z, dimensions, opts = {}) {
             const halfExtents = new CANNON.Vec3(dimensions.x * 0.5, dimensions.y * 0.5, dimensions.z * 0.5);
             const scale = new THREE.Vector3(
                 dimensions.x / modelBaseSize.x,
@@ -466,23 +1100,98 @@
                 sleepSpeedLimit: 0.08,
                 sleepTimeLimit: 0.45
             });
-            body.userData = { scale, lastDecalAt: -Infinity };
+            // Phase 2: apply the chosen initial rotation to the physics body.
+            // Cannon resolves contacts from this orientation, so a "lying" box
+            // genuinely rests on its side instead of just looking that way.
+            if (opts.initialQuat) {
+                body.quaternion.set(
+                    opts.initialQuat.x,
+                    opts.initialQuat.y,
+                    opts.initialQuat.z,
+                    opts.initialQuat.w
+                );
+            }
+            body.userData = {
+                scale,
+                lastDecalAt: -Infinity,
+                lastSfxAt: -Infinity,
+                heldBy: null,
+                savedDamping: null,
+                _maskBeforeGrab: undefined,
+                variantIdx: opts.variantIdx ?? 0,
+                instanceIdxInVariant: opts.instanceIdxInVariant ?? 0,
+                // Step 4: drives which procedural stinger plays on impact + badge on +Z face.
+                soundSymbol: opts.soundSymbol ?? 'neutral'
+            };
             body.addEventListener("collide", (event) => handleBoxCollision(body, event));
             world.addBody(body); bodies.push(body);
             instanceScales.push(scale);
-            
-            initialPos.push(new CANNON.Vec3(x,y,z));
+
+            initialPos.push(new CANNON.Vec3(x, y, z));
+            initialQuats.push(opts.initialQuat
+                ? new CANNON.Quaternion(opts.initialQuat.x, opts.initialQuat.y, opts.initialQuat.z, opts.initialQuat.w)
+                : new CANNON.Quaternion(0, 0, 0, 1));
+            attachSymbolBadgeToBody(body);
+        }
+
+        // --- STEP 3 helpers ---
+        // Weighted categorical sampling. Returns an index into `weights`.
+        function pickWeightedIndex(weights) {
+            let r = Math.random();
+            for (let i = 0; i < weights.length; i++) {
+                r -= weights[i];
+                if (r <= 0) return i;
+            }
+            return weights.length - 1;
+        }
+
+        // Phase 2: choose an initial orientation. Stacked boxes are kept upright
+        // because the placement code carefully computed their resting Y on top
+        // of a support; rotating them would intersect the support and break the
+        // pile. Ground boxes can lie flat (90 degrees on X or Z) or just tilt
+        // slightly for natural variety.
+        function pickInitialRotation(placement) {
+            const result = { quat: new CANNON.Quaternion(0, 0, 0, 1), lying: false, lyingAxis: null };
+            const isGround = !placement.support;
+            if (!isGround) return result;
+
+            if (Math.random() < LYING_PROBABILITY) {
+                const axis = Math.random() < 0.5 ? 'x' : 'z';
+                const sign = Math.random() < 0.5 ? 1 : -1;
+                if (axis === 'x') result.quat.setFromEuler(sign * Math.PI / 2, 0, 0);
+                else              result.quat.setFromEuler(0, 0, sign * Math.PI / 2);
+                result.lying = true;
+                result.lyingAxis = axis;
+                return result;
+            }
+            if (Math.random() < TILT_PROBABILITY) {
+                const tx = (Math.random() - 0.5) * TILT_MAX_RAD * 2;
+                const tz = (Math.random() - 0.5) * TILT_MAX_RAD * 2;
+                result.quat.setFromEuler(tx, 0, tz);
+            }
+            return result;
+        }
+
+        // After a 90-degree rotation, the half-extent that used to point up is
+        // now pointing sideways, so the new resting Y must use a different axis.
+        // Around X: +y maps to +z, so half-height becomes dimensions.z/2.
+        // Around Z: +y maps to +x, so half-height becomes dimensions.x/2.
+        function adjustYForRotation(placement, rotInfo) {
+            if (!rotInfo.lying) return placement.y;
+            if (rotInfo.lyingAxis === 'x') return placement.dimensions.z * 0.5;
+            if (rotInfo.lyingAxis === 'z') return placement.dimensions.x * 0.5;
+            return placement.y;
         }
 
         // Chão e Grelha
         const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane(), material: matDefault });
         floorBody.quaternion.setFromEuler(-Math.PI/2, 0, 0); world.addBody(floorBody);
-        const grid = new THREE.GridHelper(30, 30, 0x3a3a3a, 0x111111);
+        const grid = new THREE.GridHelper(42, 42, 0x3a3a3a, 0x111111);
         grid.position.y = -0.001;
         scene.add(grid);
 
         const floorVisual = new THREE.Mesh(
-            new THREE.CircleGeometry(12, 64),
+            new THREE.CircleGeometry(17, 72),
             new THREE.MeshStandardMaterial({
                 color: 0x0d0d0d,
                 roughness: 0.95,
@@ -588,29 +1297,45 @@
         }
 
         function handleBoxCollision(body, event) {
-            const impact = Math.abs(event.contact.getImpactVelocityAlongNormal());
-            if (impact < DECAL_IMPACT_THRESHOLD) return;
-
+            const contact = event.contact;
+            const impactRaw = Math.abs(contact.getImpactVelocityAlongNormal());
+            const impactEff = effectiveImpactFromContact(contact);
+            const other = contact.bi === body ? contact.bj : contact.bi;
             const now = performance.now();
+
+            // Step 4: use impactEff (includes closing speed) for audio; keep impactRaw
+            // for decals so chalk marks still mostly track sharp real impacts.
+            if (impactEff >= IMPACT_AUDIO_MIN) {
+                if (now - (body.userData.lastSfxAt || 0) > 68) {
+                    body.userData.lastSfxAt = now;
+                    if (other === floorBody) {
+                        playFullCollisionAudio(body, null, impactEff);
+                    } else if (other.mass > 0 && other.userData?.scale) {
+                        if (body.id <= other.id) playFullCollisionAudio(body, other, impactEff);
+                    }
+                }
+            }
+
+            if (impactRaw < DECAL_IMPACT_THRESHOLD) return;
+
             if (now - (body.userData.lastDecalAt || 0) < 90) return;
             body.userData.lastDecalAt = now;
 
-            const other = event.contact.bi === body ? event.contact.bj : event.contact.bi;
             const contactPoint = getContactWorldPoint(body, event.contact);
-            triggerCollisionVisuals(impact, contactPoint);
+            triggerCollisionVisuals(impactRaw, contactPoint);
 
             if (other === floorBody) {
-                createFloorDecal(contactPoint, impact);
+                createFloorDecal(contactPoint, impactRaw);
                 return;
             }
 
             if (other.mass === 0) return;
 
             if (other.mass > 0 && body.id > other.id) return;
-            createBoxDecal(body, event.contact, impact);
+            createBoxDecal(body, event.contact, impactRaw);
 
             if (other.mass > 0 && other.userData?.scale) {
-                createBoxDecal(other, event.contact, impact * 0.92);
+                createBoxDecal(other, event.contact, impactRaw * 0.92);
             }
         }
 
@@ -827,28 +1552,59 @@
                 throw err;
             }
 
+            releaseAllGrips();
+            disposeAllSymbolBadgeMeshes();
             bodies.forEach((body) => world.removeBody(body));
             bodies.length = 0;
             initialPos.length = 0;
+            initialQuats.length = 0;
             instanceScales.length = 0;
             clearDecals();
 
             const plan = [];
 
-            createWallAggregation(plan, -2.3, -0.85, { segments: 5, angle: Math.PI * 0.48 });
-            createWallAggregation(plan, 2.3, -0.9, { segments: 5, angle: Math.PI * 0.52 });
-            createWallAggregation(plan, -1.8, 1.15, { segments: 4, angle: Math.PI * 0.18 });
-            createWallAggregation(plan, 1.95, 1.2, { segments: 4, angle: Math.PI * 0.82 });
+            createWallAggregation(plan, -3.15, -1.05, { segments: 5, angle: Math.PI * 0.48 });
+            createWallAggregation(plan, 3.15, -1.1, { segments: 5, angle: Math.PI * 0.52 });
+            createWallAggregation(plan, -2.45, 1.45, { segments: 4, angle: Math.PI * 0.18 });
+            createWallAggregation(plan, 2.55, 1.5, { segments: 4, angle: Math.PI * 0.82 });
 
-            createPlatformAggregation(plan, 0, -1.65, { cols: 3, rows: 2, gap: 0.07 });
-            createPlatformAggregation(plan, 0.15, 1.85, { cols: 2, rows: 2, gap: 0.06 });
+            createPlatformAggregation(plan, 0, -2.15, { cols: 3, rows: 2, gap: 0.08 });
+            createPlatformAggregation(plan, 0.2, 2.35, { cols: 2, rows: 2, gap: 0.07 });
 
-            createColumnAggregation(plan, -2.65, 0.55, { count: 4, radius: 1.12 });
-            createColumnAggregation(plan, 2.65, 0.45, { count: 4, radius: 1.12 });
+            createColumnAggregation(plan, -3.55, 0.65, { count: 4, radius: 1.28 });
+            createColumnAggregation(plan, 3.55, 0.55, { count: 4, radius: 1.28 });
 
             const stablePlan = sanitizePlan(plan);
-            createInstancedBoxes(stablePlan.length);
-            stablePlan.forEach((item) => createBox(item.x, item.y, item.z, item.dimensions));
+
+            // Step 3 + Step 4 enrichment pass. For every placement we decide:
+            //   - which face-pattern variant it will render with (Phase 1)
+            //   - whether it tilts or lies on its side, and at what Y (Phase 2)
+            //   - which audio / badge symbol tag it carries (Step 4)
+            // We do this before allocating InstancedMesh objects so we can size
+            // each one to the exact number of instances it will contain.
+            const enriched = stablePlan.map((p) => {
+                const variantIdx = pickWeightedIndex(FACE_VARIANT_WEIGHTS);
+                const rotInfo = pickInitialRotation(p);
+                const y = adjustYForRotation(p, rotInfo);
+                const soundSymbol = pickSoundSymbol();
+                return { ...p, y, variantIdx, rotInfo, soundSymbol };
+            });
+
+            const counts = new Array(FACE_VARIANTS.length).fill(0);
+            for (const e of enriched) counts[e.variantIdx]++;
+
+            createInstancedMeshesForCounts(counts);
+
+            const cursors = new Array(FACE_VARIANTS.length).fill(0);
+            for (const e of enriched) {
+                const instanceIdxInVariant = cursors[e.variantIdx]++;
+                createBox(e.x, e.y, e.z, e.dimensions, {
+                    variantIdx: e.variantIdx,
+                    instanceIdxInVariant,
+                    initialQuat: e.rotInfo.quat,
+                    soundSymbol: e.soundSymbol
+                });
+            }
         }
 
         // --- 3. PARTÍCULAS (SPRITES ORGÂNICOS) ---
@@ -1002,7 +1758,7 @@
             backgroundLight.position.set(pos.x * 0.4, 4 + energy, -6 + pos.z * 0.2);
         }
 
-        function wakeNearbyBoxes(x, y, z, radius = 2.2) {
+        function wakeNearbyBoxes(x, y, z, radius = 3.1) {
             const radiusSq = radius * radius;
             for (const body of bodies) {
                 const dx = body.position.x - x;
@@ -1029,25 +1785,239 @@
                 mass: 0,
                 type: CANNON.Body.KINEMATIC,
                 position: new CANNON.Vec3(0, -5, 0),
-                shape: new CANNON.Sphere(1.05),
+                shape: new CANNON.Sphere(1.18),
                 material: matPlayer,
-                collisionResponse: true
+                collisionResponse: true,
+                collisionFilterGroup: HAND_COLLISION_GROUP,
+                collisionFilterMask: -1
             });
-            body.userData = { lastPos: new CANNON.Vec3(0, -5, 0) };
+            body.userData = {
+                lastPos: new CANNON.Vec3(0, -5, 0),
+                grip: { isGrabbing: false, grabbed: null, constraint: null, recentVels: [] }
+            };
             body.updateMassProperties();
             world.addBody(body);
             body.addEventListener("collide", (e) => {
-                const impact = e.contact.getImpactVelocityAlongNormal();
-                if(Math.abs(impact) > 0.8) {
-                    let obj = (e.contact.bi === body) ? e.contact.bj : e.contact.bi;
-                    if(obj.mass > 0) { 
-                        spawnExplosion(body.position);
-                        playSound(Math.abs(impact));
-                        triggerCollisionVisuals(Math.abs(impact), body.position);
-                    }
+                const grabbed = body.userData.grip.grabbed;
+                if (grabbed && (e.contact.bi === grabbed || e.contact.bj === grabbed)) return;
+                const impactRaw = Math.abs(e.contact.getImpactVelocityAlongNormal());
+                const eff = effectiveImpactFromContact(e.contact);
+                const obj = (e.contact.bi === body) ? e.contact.bj : e.contact.bi;
+                if (eff >= IMPACT_AUDIO_MIN && obj.mass > 0) {
+                    playFullCollisionAudio(obj, null, eff);
+                }
+                const visMag = Math.max(impactRaw, eff);
+                if (visMag > 0.8 && obj.mass > 0) {
+                    spawnExplosion(body.position);
+                    triggerCollisionVisuals(visMag, body.position);
                 }
             });
             return body;
+        }
+
+        // --- 4.b. GRAB / THROW MECHANICS ---
+        // Pose lite does not actually estimate finger curl: landmarks 17-22 are
+        // approximate offsets from the wrist and stay almost constant whether the
+        // hand is open or closed. We therefore use HandLandmarker, which produces
+        // 21 real hand keypoints, to compute a usable closure ratio.
+        //   landmarks[0]  -> wrist
+        //   landmarks[9]  -> middle finger MCP (palm anchor, used as hand-size ruler)
+        //   landmarks[8/12/16/20] -> index/middle/ring/pinky tips
+        function getFistClosureFromHand(landmarks) {
+            const wrist = landmarks[0];
+            const middleMcp = landmarks[9];
+            if (!wrist || !middleMcp) return Infinity;
+            const wmx = middleMcp.x - wrist.x;
+            const wmy = middleMcp.y - wrist.y;
+            const handSize = Math.sqrt(wmx * wmx + wmy * wmy) || 1e-4;
+            let total = 0;
+            let count = 0;
+            for (const tipIdx of [8, 12, 16, 20]) {
+                const tip = landmarks[tipIdx];
+                if (!tip) continue;
+                const dx = tip.x - wrist.x;
+                const dy = tip.y - wrist.y;
+                total += Math.sqrt(dx * dx + dy * dy);
+                count++;
+            }
+            if (count === 0) return Infinity;
+            return (total / count) / handSize;
+        }
+
+        // Find the closest dynamic, unheld body within reach and pin it to the
+        // hand sphere with a PointToPointConstraint. The pivot on the box is
+        // chosen as the world point that was closest to the hand at grab time,
+        // converted into the box's local frame, so the box does not snap to a
+        // weird offset and remains free to rotate naturally while held.
+        function tryGrabNearestBody(handBody) {
+            // Defensive: if this hand was already grabbing for any reason, drop
+            // it before starting a new grip so we never stack two constraints
+            // on the same hand body (would otherwise leak forever).
+            if (handBody.userData.grip.isGrabbing) {
+                releaseGrabbedBody(handBody);
+            }
+            const hp = handBody.position;
+            let best = null;
+            let bestDistSq = GRAB_REACH * GRAB_REACH;
+            for (const b of bodies) {
+                if (b.mass <= 0) continue;
+                if (b.userData.heldBy) continue;
+                const dx = b.position.x - hp.x;
+                const dy = b.position.y - hp.y;
+                const dz = b.position.z - hp.z;
+                const d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 < bestDistSq) { best = b; bestDistSq = d2; }
+            }
+            if (!best) return false;
+
+            best.wakeUp();
+            best.userData.heldBy = handBody;
+            best.userData._maskBeforeGrab = best.collisionFilterMask;
+            best.collisionFilterMask = best.collisionFilterMask & ~HAND_COLLISION_GROUP;
+            best.userData.savedDamping = { lin: best.linearDamping, ang: best.angularDamping };
+            best.linearDamping = 0.6;
+            best.angularDamping = 0.7;
+
+            const worldOffset = new CANNON.Vec3(
+                hp.x - best.position.x,
+                hp.y - best.position.y,
+                hp.z - best.position.z
+            );
+            const boxLocalPivot = new CANNON.Vec3();
+            best.quaternion.conjugate().vmult(worldOffset, boxLocalPivot);
+
+            const constraint = new CANNON.PointToPointConstraint(
+                handBody, new CANNON.Vec3(0, 0, 0),
+                best, boxLocalPivot,
+                GRAB_CONSTRAINT_FORCE
+            );
+            world.addConstraint(constraint);
+
+            const grip = handBody.userData.grip;
+            grip.isGrabbing = true;
+            grip.grabbed = best;
+            grip.constraint = constraint;
+            grip.recentVels.length = 0;
+
+            spawnExplosion(handBody.position);
+            return true;
+        }
+
+        function releaseGrabbedBody(handBody) {
+            const grip = handBody.userData.grip;
+            if (!grip || !grip.isGrabbing) return;
+
+            if (grip.constraint) {
+                try { world.removeConstraint(grip.constraint); } catch (e) {}
+            }
+
+            const body = grip.grabbed;
+            if (body) {
+                body.userData.heldBy = null;
+                if (body.userData._maskBeforeGrab !== undefined) {
+                    body.collisionFilterMask = body.userData._maskBeforeGrab;
+                    body.userData._maskBeforeGrab = undefined;
+                }
+                if (body.userData.savedDamping) {
+                    body.linearDamping = body.userData.savedDamping.lin;
+                    body.angularDamping = body.userData.savedDamping.ang;
+                    body.userData.savedDamping = null;
+                }
+
+                let avgX = 0, avgY = 0, avgZ = 0;
+                const n = Math.max(1, grip.recentVels.length);
+                for (const v of grip.recentVels) { avgX += v.x; avgY += v.y; avgZ += v.z; }
+                avgX = THREE.MathUtils.clamp((avgX / n) * THROW_VELOCITY_MULT, -THROW_VELOCITY_CAP, THROW_VELOCITY_CAP);
+                avgY = THREE.MathUtils.clamp((avgY / n) * THROW_VELOCITY_MULT, -THROW_VELOCITY_CAP, THROW_VELOCITY_CAP);
+                avgZ = THREE.MathUtils.clamp((avgZ / n) * THROW_VELOCITY_MULT, -THROW_VELOCITY_CAP, THROW_VELOCITY_CAP);
+                body.velocity.set(avgX, avgY, avgZ);
+                body.angularVelocity.set(
+                    (Math.random() - 0.5) * 5,
+                    (Math.random() - 0.5) * 5,
+                    (Math.random() - 0.5) * 5
+                );
+                body.wakeUp();
+            }
+
+            grip.isGrabbing = false;
+            grip.grabbed = null;
+            grip.constraint = null;
+            grip.recentVels.length = 0;
+        }
+
+        function releaseAllGrips() {
+            for (const p of players) {
+                for (const h of p.hands) releaseGrabbedBody(h);
+            }
+        }
+
+        // Keyboard test path. Pressing G force-grabs the box closest to a hand
+        // body that is currently in stage; pressing R releases everything.
+        // This lets us validate the grab+constraint+throw physics path without
+        // depending on MediaPipe finger detection at all.
+        window.addEventListener('keydown', (e) => {
+            if (e.repeat) return;
+            const k = e.key.toLowerCase();
+            if (k === 'g') {
+                let target = null;
+                for (const p of players) {
+                    for (const h of p.hands) {
+                        if (h.position.y > -5 && !h.userData.grip.isGrabbing) {
+                            target = h;
+                            break;
+                        }
+                    }
+                    if (target) break;
+                }
+                if (target) {
+                    const ok = tryGrabNearestBody(target);
+                    console.log("[grab] manual G grab on", target.id, "succeeded=", ok);
+                } else {
+                    console.log("[grab] manual G: no free hand body in stage");
+                }
+            } else if (k === 'r') {
+                releaseAllGrips();
+                console.log("[grab] manual R release all.");
+            }
+        });
+
+        // Visible 3D markers for the hand body itself. Without these the user
+        // cannot tell where the kinematic sphere actually is in stage space, so
+        // it is impossible to know whether it is near a box at grab time.
+        const handMarkers = [];
+        for (let i = 0; i < 4; i++) {
+            const marker = new THREE.Mesh(
+                new THREE.SphereGeometry(0.24, 16, 12),
+                new THREE.MeshBasicMaterial({
+                    color: 0xff5577,
+                    transparent: true,
+                    opacity: 0.55,
+                    depthWrite: false
+                })
+            );
+            marker.visible = false;
+            scene.add(marker);
+            handMarkers.push(marker);
+        }
+
+        // Visible markers for HandLandmarker fingertips. Renders the 5 keypoints
+        // (wrist + four extended fingertips) of every detected hand so the user
+        // can confirm hand detection is actually happening in this frame.
+        const HAND_DOT_BUDGET = 4 * 5;
+        const handDots = [];
+        for (let i = 0; i < HAND_DOT_BUDGET; i++) {
+            const dot = new THREE.Mesh(
+                new THREE.SphereGeometry(0.07, 10, 8),
+                new THREE.MeshBasicMaterial({
+                    color: 0x9affff,
+                    transparent: true,
+                    opacity: 0.95,
+                    depthWrite: false
+                })
+            );
+            dot.visible = false;
+            scene.add(dot);
+            handDots.push(dot);
         }
 
         const players = [
@@ -1065,21 +2035,28 @@
         let lastSeen = Date.now();
         let isResetting = false;
 
+        // Cannon's Quaternion.slerp(toQuat, t) returns a NEW quaternion and does
+        // NOT mutate `this`. The pre-Step-3 code discarded the result, so resets
+        // never rotated boxes back. We pass `body.quaternion` as the explicit
+        // target (third arg) so the slerp writes in place. We also slerp toward
+        // each box's recorded initial quaternion, which is identity for upright
+        // boxes and a tilt/lying rotation for the Phase 2 ones.
         function updateReset() {
-            if(!isResetting) return;
+            if (!isResetting) return;
             let done = true;
-            for(let i=0; i<bodies.length; i++) {
-                bodies[i].velocity.set(0,0,0);
-                bodies[i].angularVelocity.set(0,0,0);
-                
-                bodies[i].position.x += (initialPos[i].x - bodies[i].position.x) * 0.05;
-                bodies[i].position.y += (initialPos[i].y - bodies[i].position.y) * 0.05;
-                bodies[i].position.z += (initialPos[i].z - bodies[i].position.z) * 0.05;
-                bodies[i].quaternion.slerp(new CANNON.Quaternion(0,0,0,1), 0.05);
+            for (let i = 0; i < bodies.length; i++) {
+                const body = bodies[i];
+                body.velocity.set(0, 0, 0);
+                body.angularVelocity.set(0, 0, 0);
 
-                if(bodies[i].position.distanceTo(initialPos[i]) > 0.05) done = false;
+                body.position.x += (initialPos[i].x - body.position.x) * 0.05;
+                body.position.y += (initialPos[i].y - body.position.y) * 0.05;
+                body.position.z += (initialPos[i].z - body.position.z) * 0.05;
+                body.quaternion.slerp(initialQuats[i], 0.05, body.quaternion);
+
+                if (body.position.distanceTo(initialPos[i]) > 0.05) done = false;
             }
-            if(done) { isResetting = false; resetMsg.style.opacity = 0; }
+            if (done) { isResetting = false; resetMsg.style.opacity = 0; }
         }
 
         // --- 6. IA / MEDIAPIPE ---
@@ -1090,6 +2067,7 @@
         // believable motion.
         const video = document.getElementById("webcam");
         let landmarker;
+        let handLandmarker;
         let lastDetectAt = 0;
 
         // AI startup is deferred until the user explicitly begins the installation because both
@@ -1103,8 +2081,30 @@
                     baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`, delegate: "GPU" },
                     runningMode: "VIDEO", numPoses: 2
                 });
+
+                statusMain.innerText = "A carregar deteção de mãos...";
+                try {
+                    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                        baseOptions: {
+                            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+                            delegate: "GPU"
+                        },
+                        runningMode: "VIDEO",
+                        numHands: 4,
+                        minHandDetectionConfidence: HAND_DETECT_CONFIDENCE,
+                        minHandPresenceConfidence: HAND_DETECT_CONFIDENCE,
+                        minTrackingConfidence: HAND_DETECT_CONFIDENCE
+                    });
+                    console.log("[grab] HandLandmarker carregado com sucesso.");
+                } catch (handErr) {
+                    console.warn("[grab] HandLandmarker indisponível; o gesto de agarrar fica desativado.", handErr);
+                    handLandmarker = null;
+                }
+
                 await buildStack();
-                statusMain.innerText = "Ligado! Entra na câmara.";
+                statusMain.innerText = handLandmarker
+                    ? "Ligado! Entra na câmara. Fecha a mão para agarrar."
+                    : "Ligado! Entra na câmara. (sem deteção de mãos)";
                 
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
                 video.srcObject = stream;
@@ -1116,12 +2116,20 @@
 
         // MediaPipe landmarks arrive in normalized camera space. We remap them into stage space so
         // the visitor's body becomes a physical performer inside the set, rather than a UI overlay.
-        function map(lm) {
+        function mapLandmarkToStage(lm, cfg) {
             return {
-                x: (0.5 - lm.x) * 12,
-                y: (1 - lm.y) * 8,
-                z: THREE.MathUtils.clamp(-lm.z * 14, -2.4, 2.4)
+                x: (0.5 - lm.x) * cfg.scaleX,
+                y: (1 - lm.y) * cfg.scaleY,
+                z: THREE.MathUtils.clamp(-lm.z * cfg.zMult, -cfg.zClamp, cfg.zClamp)
             };
+        }
+
+        function mapSilhouette(lm) {
+            return mapLandmarkToStage(lm, STAGE_MAP_SILHOUETTE);
+        }
+
+        function mapHand(lm) {
+            return mapLandmarkToStage(lm, STAGE_MAP_HAND);
         }
 
         let lastTime = -1;
@@ -1135,8 +2143,64 @@
                 const previousTime = lastTime;
                 lastTime = video.currentTime;
                 lastDetectAt = nowMs;
-                const result = await landmarker.detectForVideo(video, nowMs);
-                
+                // detectForVideo is synchronous in VIDEO running-mode, so we do
+                // NOT wrap the calls in extra Promise plumbing (the previous
+                // version added microtask overhead and obscured errors). Each
+                // call is in its own try/catch so a transient failure in one
+                // detector cannot kill the prediction loop.
+                let result = null;
+                try { result = landmarker.detectForVideo(video, nowMs); }
+                catch (err) { console.warn("[grab] pose detect error", err); }
+                let handResult = null;
+                if (handLandmarker) {
+                    try { handResult = handLandmarker.detectForVideo(video, nowMs); }
+                    catch (err) { console.warn("[grab] hand detect error", err); }
+                }
+                if (!result) {
+                    requestAnimationFrame(predict);
+                    return;
+                }
+
+                // Match every detected hand to the most plausible player hand-body
+                // using all-pairs sorted assignment. Building all candidate pairs
+                // first and consuming them in increasing-distance order avoids the
+                // failure case where the first hand greedily steals a body that a
+                // later hand was a much better match for.
+                // We also reject pose wrists with low visibility so that phantom
+                // landmarks for occluded hands cannot poison the assignment.
+                const handLandmarksByHandBody = new Map();
+                if (handResult && handResult.landmarks && handResult.landmarks.length) {
+                    const pairs = [];
+                    for (const hLandmarks of handResult.landmarks) {
+                        const handWrist = hLandmarks[0];
+                        if (!handWrist) continue;
+                        for (const p of players) {
+                            const poseLms = result.landmarks[p.id];
+                            if (!poseLms) continue;
+                            for (let i = 0; i < 2; i++) {
+                                const poseWrist = poseLms[15 + i];
+                                if (!poseWrist) continue;
+                                const vis = poseWrist.visibility !== undefined ? poseWrist.visibility : 1;
+                                if (vis < POSE_WRIST_MIN_VISIBILITY) continue;
+                                const dx = handWrist.x - poseWrist.x;
+                                const dy = handWrist.y - poseWrist.y;
+                                const d = Math.sqrt(dx * dx + dy * dy);
+                                if (d <= HAND_MATCH_DISTANCE) {
+                                    pairs.push({ hLandmarks, handBody: p.hands[i], dist: d });
+                                }
+                            }
+                        }
+                    }
+                    pairs.sort((a, b) => a.dist - b.dist);
+                    const claimedHands = new Set();
+                    for (const pair of pairs) {
+                        if (claimedHands.has(pair.hLandmarks)) continue;
+                        if (handLandmarksByHandBody.has(pair.handBody)) continue;
+                        claimedHands.add(pair.hLandmarks);
+                        handLandmarksByHandBody.set(pair.handBody, pair.hLandmarks);
+                    }
+                }
+
                 let active = false;
                 players.forEach((p, idx) => {
                     if(result.landmarks[idx]) {
@@ -1149,6 +2213,7 @@
                         wrists.forEach((wrist, handIdx) => {
                             const handBody = p.hands[handIdx];
                             if (!wrist) {
+                                releaseGrabbedBody(handBody);
                                 handBody.velocity.set(0, 0, 0);
                                 handBody.position.set(0, -10, 0);
                                 handBody.aabbNeedsUpdate = true;
@@ -1156,7 +2221,7 @@
                                 return;
                             }
 
-                            const hand = map(wrist);
+                            const hand = mapHand(wrist);
                             const lastPos = handBody.userData.lastPos;
                             handBody.velocity.set(
                                 (hand.x - lastPos.x) / dt,
@@ -1167,6 +2232,36 @@
                             handBody.aabbNeedsUpdate = true;
                             handBody.userData.lastPos.set(hand.x, hand.y, hand.z);
                             wakeNearbyBoxes(hand.x, hand.y, hand.z);
+
+                            const grip = handBody.userData.grip;
+                            grip.recentVels.push({
+                                x: handBody.velocity.x,
+                                y: handBody.velocity.y,
+                                z: handBody.velocity.z
+                            });
+                            if (grip.recentVels.length > VELOCITY_SAMPLES) grip.recentVels.shift();
+
+                            const matchedHand = handLandmarksByHandBody.get(handBody);
+                            const grabAt = GRAB_FIST_THRESHOLD * FINGER_SENSITIVITY;
+                            const releaseAt = GRAB_RELEASE_THRESHOLD * FINGER_SENSITIVITY;
+                            if (matchedHand) {
+                                grip.lastHandSeenAt = nowMs;
+                                const closure = getFistClosureFromHand(matchedHand);
+                                grip.lastClosure = closure;
+                                if (!grip.isGrabbing && closure < grabAt) {
+                                    tryGrabNearestBody(handBody);
+                                } else if (grip.isGrabbing && closure > releaseAt) {
+                                    releaseGrabbedBody(handBody);
+                                }
+                            } else if (grip.isGrabbing) {
+                                // Hand model dropped this hand. Give a short grace
+                                // window; if it stays missing, defensively release
+                                // so a stuck constraint cannot hold a box forever.
+                                const lastSeen = grip.lastHandSeenAt || 0;
+                                if (nowMs - lastSeen > GRAB_HAND_LOST_GRACE_MS) {
+                                    releaseGrabbedBody(handBody);
+                                }
+                            }
                         });
 
                         const arr = p.line.geometry.attributes.position.array;
@@ -1175,17 +2270,19 @@
                             const pointA = lms[pair[0]];
                             const pointB = lms[pair[1]];
                             if (!pointA || !pointB) return;
-                            const a = map(pointA);
-                            const b = map(pointB);
+                            const a = mapSilhouette(pointA);
+                            const b = mapSilhouette(pointB);
                             arr[k++] = a.x; arr[k++] = a.y; arr[k++] = a.z;
                             arr[k++] = b.x; arr[k++] = b.y; arr[k++] = b.z;
                         });
                         while (k < arr.length) arr[k++] = 0;
                         p.line.geometry.attributes.position.needsUpdate = true;
                         p.line.visible = true;
-                        p.div.innerText = p.name + ": Conectado";
+                        const anyGrip = p.hands.some(h => h.userData.grip.isGrabbing);
+                        p.div.innerText = p.name + ": " + (anyGrip ? "Agarrado" : "Conectado");
                     } else {
                         p.hands.forEach((handBody) => {
+                            releaseGrabbedBody(handBody);
                             handBody.velocity.set(0, 0, 0);
                             handBody.position.set(0, -10, 0);
                             handBody.aabbNeedsUpdate = true;
@@ -1202,7 +2299,77 @@
                 } else if (!isResetting && Date.now() - lastSeen > 3000) {
                     isResetting = true;
                     resetMsg.style.opacity = 1;
+                    releaseAllGrips();
                 }
+
+                // Render live markers for the kinematic hand spheres so the user
+                // can see where the colliders actually are. A grabbing hand turns
+                // red; a free hand stays pink. Hands without a pose get hidden.
+                let markerIdx = 0;
+                for (const p of players) {
+                    for (const handBody of p.hands) {
+                        const m = handMarkers[markerIdx++];
+                        if (!m) break;
+                        if (handBody.position.y < -5) {
+                            m.visible = false;
+                        } else {
+                            m.visible = true;
+                            m.position.set(handBody.position.x, handBody.position.y, handBody.position.z);
+                            m.material.color.setHex(handBody.userData.grip.isGrabbing ? 0xff3030 : 0xff66aa);
+                            m.material.opacity = handBody.userData.grip.isGrabbing ? 0.9 : 0.55;
+                        }
+                    }
+                }
+
+                // Render fingertip dots for every detected hand in 3D space.
+                // These are drawn in the same coordinate system as the hand body
+                // (mapHand) so the user sees where the model "thinks" the fingers
+                // are. If no dots show up, hand detection is the failing layer.
+                let dotIdx = 0;
+                if (handResult && handResult.landmarks) {
+                    for (const hLandmarks of handResult.landmarks) {
+                        const closure = getFistClosureFromHand(hLandmarks);
+                        const isFist = Number.isFinite(closure) && closure < (GRAB_FIST_THRESHOLD * FINGER_SENSITIVITY);
+                        const color = isFist ? 0xff5555 : 0x9affff;
+                        for (const tipIdx of [0, 8, 12, 16, 20]) {
+                            if (dotIdx >= handDots.length) break;
+                            const tip = hLandmarks[tipIdx];
+                            const dot = handDots[dotIdx++];
+                            if (!tip) { dot.visible = false; continue; }
+                            const pos = mapHand(tip);
+                            dot.position.set(pos.x, pos.y, pos.z);
+                            dot.material.color.setHex(color);
+                            dot.visible = true;
+                        }
+                    }
+                }
+                for (let i = dotIdx; i < handDots.length; i++) handDots[i].visible = false;
+
+                // Live debug HUD. Shows what every layer of the grab pipeline is
+                // actually producing, so threshold problems stop being invisible.
+                const dbg = [];
+                dbg.push("hand model: " + (handLandmarker ? "ON" : "OFF"));
+                dbg.push("hands det:  " + (handResult && handResult.landmarks ? handResult.landmarks.length : 0));
+                dbg.push("matched:    " + handLandmarksByHandBody.size);
+                dbg.push("grab<" + (GRAB_FIST_THRESHOLD * FINGER_SENSITIVITY).toFixed(2) +
+                        "  release>" + (GRAB_RELEASE_THRESHOLD * FINGER_SENSITIVITY).toFixed(2));
+                dbg.push("keys: G=grab nearest, R=release all");
+                for (const p of players) {
+                    for (let hi = 0; hi < p.hands.length; hi++) {
+                        const handBody = p.hands[hi];
+                        const matched = handLandmarksByHandBody.get(handBody);
+                        const liveClosure = matched ? getFistClosureFromHand(matched) : null;
+                        const cached = handBody.userData.grip.lastClosure;
+                        const showClosure = liveClosure !== null
+                            ? liveClosure
+                            : (typeof cached === 'number' ? cached : null);
+                        const grab = handBody.userData.grip.isGrabbing ? "GRAB" : "    ";
+                        const tag = liveClosure !== null ? "" : (showClosure !== null ? " (last)" : "");
+                        dbg.push(p.name + ".h" + hi + " " + grab +
+                                 " closure=" + (showClosure === null ? "—" : (Number.isFinite(showClosure) ? showClosure.toFixed(2) : "inf")) + tag);
+                    }
+                }
+                statusDebug.innerText = dbg.join("\n");
             }
             requestAnimationFrame(predict);
         }
@@ -1228,18 +2395,36 @@
             bloomPass.radius = BLOOM_CONFIG.radius + collisionPulse * 0.08;
             bloomPass.strength = BLOOM_CONFIG.strength + collisionPulse * BLOOM_PULSE_STRENGTH;
 
-            if (boxInstancedMesh) {
+            if (boxInstancedMeshes) {
+                // Per-variant dirty bitmap. We always rewrite matrices CPU-side
+                // (the cost is negligible) but only flag variants that contain
+                // a body that actually moved this frame. Settled scenes therefore
+                // skip the per-variant GPU buffer upload entirely.
+                const dirty = boxInstancedMeshesDirtyScratch;
+                for (let v = 0; v < dirty.length; v++) dirty[v] = isResetting;
+
                 for (let i = 0; i < bodies.length; i++) {
                     const body = bodies[i];
+                    const variantIdx = body.userData.variantIdx | 0;
+                    const mesh = boxInstancedMeshes[variantIdx];
+                    if (!mesh) continue;
+                    if (body.sleepState !== CANNON.Body.SLEEPING) dirty[variantIdx] = true;
+
+                    const instanceIdx = body.userData.instanceIdxInVariant | 0;
                     const scale = instanceScales[i];
                     instanceDummy.position.set(body.position.x, body.position.y, body.position.z);
                     instanceDummy.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
                     instanceDummy.scale.copy(scale);
                     instanceDummy.updateMatrix();
-                    boxInstancedMesh.setMatrixAt(i, instanceDummy.matrix);
+                    mesh.setMatrixAt(instanceIdx, instanceDummy.matrix);
                 }
-                boxInstancedMesh.instanceMatrix.needsUpdate = true;
+                for (let v = 0; v < boxInstancedMeshes.length; v++) {
+                    const mesh = boxInstancedMeshes[v];
+                    if (mesh && dirty[v]) mesh.instanceMatrix.needsUpdate = true;
+                }
             }
+
+            updateSymbolBadgeMeshes();
 
             for(let p of particles) {
                 if(p.visible) {
